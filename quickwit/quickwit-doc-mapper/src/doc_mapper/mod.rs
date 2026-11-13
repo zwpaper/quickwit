@@ -15,6 +15,7 @@
 mod date_time_type;
 mod doc_mapper_builder;
 mod doc_mapper_impl;
+mod fast_json;
 mod field_mapping_entry;
 mod field_mapping_type;
 mod field_presence;
@@ -28,6 +29,7 @@ use std::ops::Bound;
 
 pub use doc_mapper_builder::DocMapperBuilder;
 pub use doc_mapper_impl::DocMapper;
+pub use fast_json::FastJsonError;
 pub use field_mapping_entry::{
     BinaryFormat, FastFieldOptions, FieldMappingEntry, QuickwitBytesOptions, QuickwitJsonOptions,
     QuickwitTextNormalizer,
