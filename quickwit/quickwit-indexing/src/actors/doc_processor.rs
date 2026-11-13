@@ -23,7 +23,7 @@ use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, Qu
 use quickwit_common::rate_limited_tracing::rate_limited_warn;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_config::{SourceInputFormat, TransformConfig};
-use quickwit_doc_mapper::{DocMapper, DocParsingError, JsonObject};
+use quickwit_doc_mapper::{DocMapper, DocParsingError, FastJsonError, JsonObject};
 use quickwit_metrics::{Counter, counter, labels};
 use quickwit_opentelemetry::otlp::{
     JsonLogIterator, JsonSpanIterator, OtlpLogsError, OtlpTracesError, parse_otlp_logs_json,
@@ -410,6 +410,9 @@ pub struct DocProcessor {
     fingerprinter_opt: Option<Fingerprinter>,
     counters: Arc<DocProcessorCounters>,
     publish_lock: PublishLock,
+    /// Whether ordinary JSON documents go through the schema-guided fast decoder. Decided
+    /// from the mapper configuration and the source settings, never from the input.
+    fast_json_opt: bool,
     #[cfg(feature = "vrl")]
     transform_opt: Option<VrlProgram>,
     input_format: SourceInputFormat,
@@ -429,6 +432,12 @@ impl DocProcessor {
         if cfg!(not(feature = "vrl")) && transform_config_opt.is_some() {
             bail!("VRL is not enabled: please recompile with the `vrl` feature")
         }
+        // The fast decoder is chosen from the configuration alone, so an unsupported
+        // document is never parsed by both paths.
+        let fast_json_opt = matches!(input_format, SourceInputFormat::Json)
+            && fingerprinter_opt.is_none()
+            && transform_config_opt.is_none()
+            && doc_mapper.supports_fast_json();
         Ok(DocProcessor {
             doc_mapper,
             indexer_mailbox,
@@ -436,6 +445,7 @@ impl DocProcessor {
             fingerprinter_opt,
             counters: Arc::new(DocProcessorCounters::new(index_id, source_id)),
             publish_lock: PublishLock::default(),
+            fast_json_opt,
             #[cfg(feature = "vrl")]
             transform_opt: transform_config_opt
                 .map(VrlProgram::try_from_transform_config)
@@ -466,6 +476,10 @@ impl DocProcessor {
 
     fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
         let num_bytes = raw_doc.len();
+        if self.fast_json_opt {
+            self.process_raw_doc_fast(raw_doc, processed_docs);
+            return;
+        }
 
         #[cfg(feature = "vrl")]
         let transform_opt = self.transform_opt.as_mut();
@@ -490,6 +504,47 @@ impl DocProcessor {
                     );
                     self.counters.record_error(error, num_bytes as u64);
                 }
+            }
+        }
+    }
+
+    /// Schema-guided fast path for ordinary flat JSON documents.
+    ///
+    /// The mapper is supported and no VRL transform or fingerprint is configured (see
+    /// `fast_json_opt`), so the legacy parser is never entered first: the document is
+    /// parsed exactly once.
+    fn process_raw_doc_fast(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
+        let num_bytes = raw_doc.len();
+        let outcome = self
+            .doc_mapper
+            .doc_from_json_bytes_fast(&raw_doc)
+            .map_err(|error| match error {
+                FastJsonError::Json(error) => DocProcessorError::JsonParsing(error.to_string()),
+                FastJsonError::Schema(error) => DocProcessorError::DocMapperParsing(error),
+            })
+            .and_then(|(partition, doc)| {
+                let timestamp_opt = self.extract_timestamp(&doc)?;
+                Ok(ProcessedDoc {
+                    doc,
+                    fingerprint_opt: None,
+                    timestamp_opt,
+                    partition,
+                    num_bytes,
+                })
+            });
+        match outcome {
+            Ok(processed_doc) => {
+                self.counters.record_valid(num_bytes as u64);
+                processed_docs.push(processed_doc);
+            }
+            Err(error) => {
+                rate_limited_warn!(
+                    limit_per_min = 10,
+                    index_id = self.counters.index_id,
+                    source_id = self.counters.source_id,
+                    "{error}",
+                );
+                self.counters.record_error(error, num_bytes as u64);
             }
         }
     }
