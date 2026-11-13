@@ -751,6 +751,49 @@ pub(crate) trait NumVal: Sized + FromStr + ToString + Into<TantivyValue> {
     fn from_json(json_val: JsonValue, coerce: bool) -> Result<TantivyValue, String> {
         Self::from_json_to_self(&json_val, coerce).map(Self::into)
     }
+
+    /// The borrowed-input sibling of [`NumVal::from_json`]: it accepts the same values
+    /// and returns the same error messages, but reads a `serde_json_borrow::Value` and
+    /// returns the scalar itself so the caller can use the leaf-typed `add_*`
+    /// constructor instead of materializing an owned `OwnedValue`.
+    fn from_borrowed_json(json_val: &BorrowedJsonValue, coerce: bool) -> Result<Self, String> {
+        match json_val {
+            BorrowedJsonValue::Number(num_val) => {
+                let num_val = serde_json::Number::from(*num_val);
+                Self::from_json_number(&num_val).ok_or_else(|| {
+                    format!(
+                        "expected {}, got inconvertible JSON number `{}`",
+                        type_name::<Self>(),
+                        num_val
+                    )
+                })
+            }
+            BorrowedJsonValue::Str(str_val) => {
+                if coerce {
+                    str_val.parse::<Self>().map_err(|_| {
+                        format!(
+                            "failed to coerce JSON string `\"{str_val}\"` to {}",
+                            type_name::<Self>()
+                        )
+                    })
+                } else {
+                    Err(format!(
+                        "expected JSON number, got string `\"{str_val}\"`. enable coercion to {} \
+                         with the `coerce` parameter in the field mapping",
+                        type_name::<Self>()
+                    ))
+                }
+            }
+            _ => {
+                let message = if coerce {
+                    format!("expected JSON number or string, got `{json_val}`")
+                } else {
+                    format!("expected JSON number, got `{json_val}`")
+                };
+                Err(message)
+            }
+        }
+    }
 }
 
 impl NumVal for u64 {
@@ -2127,6 +2170,8 @@ impl MappingLeaf {
     }
 
     /// Emits one JSON value for this leaf, exactly as `MappingTree::doc_from_json` does.
+    /// Kept for the pre-check micro-benchmark's owned-staging decoder.
+    #[cfg(test)]
     pub(crate) fn doc_from_json_value(
         &self,
         json_val: JsonValue,
@@ -2135,5 +2180,133 @@ impl MappingLeaf {
         strict_mode: bool,
     ) -> Result<(), DocParsingError> {
         self.doc_from_json(json_val, document, path, strict_mode)
+    }
+
+    /// Emits one borrowed JSON value for this leaf, mirroring `MappingTree::doc_from_json`
+    /// but writing the value with the leaf-typed `add_*` constructor instead of
+    /// materializing an owned `OwnedValue`.
+    ///
+    /// The fast path only calls this for a leaf with no concatenate fields and no
+    /// tie-breaker (see [`MappingLeaf::supports_fast_json`]); `path` is the single field
+    /// name, which is what the legacy `path.join(".")` produces for a flat schema.
+    pub(crate) fn doc_from_borrowed_json_value(
+        &self,
+        json_val: BorrowedJsonValue<'_>,
+        document: &mut Document,
+        path: &str,
+        strict_mode: bool,
+    ) -> Result<(), DocParsingError> {
+        if matches!(self.typ, LeafType::TieBreaker) {
+            return check_supplied_tie_breaker_value(
+                json_val.is_null(),
+                strict_mode,
+                path.to_string(),
+            );
+        }
+        if json_val.is_null() {
+            // We just ignore `null`.
+            return Ok(());
+        }
+        if let BorrowedJsonValue::Array(els) = json_val {
+            if self.cardinality == Cardinality::SingleValued {
+                return Err(DocParsingError::MultiValuesNotSupported(path.to_string()));
+            }
+            for el_json_val in els {
+                if el_json_val.is_null() {
+                    // We just ignore `null`.
+                    continue;
+                }
+                self.emit_borrowed_value(&el_json_val, document, path)?;
+            }
+            return Ok(());
+        }
+        self.emit_borrowed_value(&json_val, document, path)
+    }
+
+    /// Writes one non-null, non-array value with the leaf's type-specific constructor.
+    fn emit_borrowed_value(
+        &self,
+        json_val: &BorrowedJsonValue<'_>,
+        document: &mut Document,
+        path: &str,
+    ) -> Result<(), DocParsingError> {
+        let value_error = |err_msg: String| DocParsingError::ValueError(path.to_string(), err_msg);
+        match &self.typ {
+            LeafType::Text(_) => match json_val {
+                BorrowedJsonValue::Str(text) => {
+                    document.add_text(self.field, text.as_ref());
+                }
+                _ => return Err(value_error(format!("expected string, got `{json_val}`"))),
+            },
+            LeafType::I64(numeric_options) => {
+                let val = i64::from_borrowed_json(json_val, numeric_options.coerce)
+                    .map_err(value_error)?;
+                document.add_i64(self.field, val);
+            }
+            LeafType::U64(numeric_options) => {
+                let val = u64::from_borrowed_json(json_val, numeric_options.coerce)
+                    .map_err(value_error)?;
+                document.add_u64(self.field, val);
+            }
+            LeafType::F64(numeric_options) => {
+                let val = f64::from_borrowed_json(json_val, numeric_options.coerce)
+                    .map_err(value_error)?;
+                document.add_f64(self.field, val);
+            }
+            LeafType::Bool(_) => match json_val {
+                BorrowedJsonValue::Bool(val) => {
+                    document.add_bool(self.field, *val);
+                }
+                _ => return Err(value_error(format!("expected boolean, got `{json_val}`"))),
+            },
+            LeafType::IpAddr(_) => match json_val {
+                BorrowedJsonValue::Str(ip_address) => {
+                    let ipv6_value = IpAddr::from_str(ip_address.as_ref())
+                        .map_err(|err| {
+                            value_error(format!("failed to parse IP address `{ip_address}`: {err}"))
+                        })?
+                        .into_ipv6_addr();
+                    document.add_ip_addr(self.field, ipv6_value);
+                }
+                _ => return Err(value_error(format!("expected string, got `{json_val}`"))),
+            },
+            LeafType::DateTime(date_time_options) => {
+                let date_time = date_time_options
+                    .parse_borrowed_json(json_val)
+                    .map_err(value_error)?;
+                document.add_date(self.field, date_time);
+            }
+            LeafType::Bytes(binary_options) => match json_val {
+                BorrowedJsonValue::Str(byte_str) => {
+                    let payload = binary_options
+                        .input_format
+                        .parse_str(byte_str.as_ref())
+                        .map_err(value_error)?;
+                    document.add_bytes(self.field, &payload);
+                }
+                _ => {
+                    return Err(value_error(format!(
+                        "expected {} string, got `{json_val}`",
+                        binary_options.input_format.as_str()
+                    )));
+                }
+            },
+            LeafType::Json(_) => {
+                // A JSON leaf is still materialized as an owned `OwnedValue::Object`,
+                // exactly as the legacy path does; only the leaf-typed scalars avoid the
+                // owned round-trip.
+                let value = self
+                    .typ
+                    .value_from_json(JsonValue::from(json_val))
+                    .map_err(value_error)?;
+                document.add_field_value(self.field, &value);
+            }
+            LeafType::TieBreaker => {
+                return Err(value_error(
+                    "tie_breaker values are generated during segment serialization".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 }

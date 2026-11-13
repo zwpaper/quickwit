@@ -2753,4 +2753,180 @@ mod tests {
         .unwrap();
         assert!(flat.supports_fast_json());
     }
+
+    /// A counting global allocator so the pre-check micro-benchmark can report the
+    /// per-document allocation count. Counting is off unless a benchmark thread turns it
+    /// on, so the rest of the test binary is unaffected.
+    mod e037_alloc {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        pub struct CountingAlloc;
+
+        thread_local! {
+            pub static COUNTING: Cell<bool> = const { Cell::new(false) };
+            pub static ALLOCS: Cell<u64> = const { Cell::new(0) };
+        }
+
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if COUNTING.with(Cell::get) {
+                    ALLOCS.with(|count| count.set(count.get() + 1));
+                }
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                if COUNTING.with(Cell::get) {
+                    ALLOCS.with(|count| count.set(count.get() + 1));
+                }
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                if COUNTING.with(Cell::get) {
+                    ALLOCS.with(|count| count.set(count.get() + 1));
+                }
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static E037_COUNTING_ALLOC: CountingAlloc = CountingAlloc;
+    }
+
+    /// E037 pre-check micro-benchmark: the owned-staging fast decoder (variant A) versus
+    /// the borrowed leaf-typed decoder (variant B), over real document lines and the real
+    /// ClickBench schema. It reports ns/doc and allocations/doc for both variants.
+    ///
+    /// `E037_BENCH_LINES` is a JSONL file (one document per line); `E037_BENCH_SCHEMA` is
+    /// a Quickwit index config YAML (the `doc_mapping` section builds the mapper).
+    #[test]
+    #[ignore = "pre-check micro-bench: set E037_BENCH_LINES and E037_BENCH_SCHEMA"]
+    fn test_fast_json_typed_borrowed_microbench() {
+        use std::cell::Cell;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        use serde_yaml::Value as YamlValue;
+        use tantivy::TantivyDocument;
+        use tantivy::schema::{Field, OwnedValue};
+
+        fn materialized(doc: &TantivyDocument) -> Vec<(Field, OwnedValue)> {
+            doc.field_values()
+                .map(|(field, value)| (field, OwnedValue::from(value)))
+                .collect()
+        }
+
+        let Some(lines_path) = std::env::var_os("E037_BENCH_LINES") else {
+            return;
+        };
+        let schema_path = std::env::var_os("E037_BENCH_SCHEMA")
+            .expect("E037_BENCH_SCHEMA must point to a Quickwit index config YAML");
+        let raw = std::fs::read(&lines_path).unwrap();
+        let lines: Vec<&[u8]> = raw
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        let config: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
+        let doc_mapping = config
+            .get("doc_mapping")
+            .expect("config has no doc_mapping");
+        let mapper: DocMapper = serde_yaml::from_value(doc_mapping.clone()).unwrap();
+        assert!(mapper.supports_fast_json());
+        let plan = mapper.fast_json_plan().unwrap();
+
+        for line in lines.iter().take(2000) {
+            black_box(plan.decode_owned(line, true).ok().unwrap());
+            black_box(plan.decode(line, true).ok().unwrap());
+        }
+
+        // The two variants must materialize byte-identical documents.
+        for line in &lines {
+            let (_, owned_doc) = plan.decode_owned(line, true).ok().unwrap();
+            let (_, borrowed_doc) = plan.decode(line, true).ok().unwrap();
+            assert_eq!(
+                materialized(&owned_doc),
+                materialized(&borrowed_doc),
+                "variant mismatch for {:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+
+        let count_allocs = |owned: bool| {
+            e037_alloc::COUNTING.with(|counting| counting.set(true));
+            e037_alloc::ALLOCS.with(|allocs| allocs.set(0));
+            for line in &lines {
+                if owned {
+                    black_box(plan.decode_owned(line, true).ok().unwrap());
+                } else {
+                    black_box(plan.decode(line, true).ok().unwrap());
+                }
+            }
+            e037_alloc::COUNTING.with(|counting| counting.set(false));
+            e037_alloc::ALLOCS.with(Cell::get)
+        };
+        let owned_allocs = count_allocs(true);
+        let borrowed_allocs = count_allocs(false);
+
+        const REPS: usize = 3;
+        let mut owned_ns_per_doc = Vec::with_capacity(REPS);
+        let mut borrowed_ns_per_doc = Vec::with_capacity(REPS);
+        for _ in 0..REPS {
+            let start = Instant::now();
+            for line in &lines {
+                black_box(plan.decode_owned(line, true).ok().unwrap());
+            }
+            owned_ns_per_doc.push(start.elapsed().as_nanos() as f64 / lines.len() as f64);
+            let start = Instant::now();
+            for line in &lines {
+                black_box(plan.decode(line, true).ok().unwrap());
+            }
+            borrowed_ns_per_doc.push(start.elapsed().as_nanos() as f64 / lines.len() as f64);
+        }
+
+        let docs = lines.len() as f64;
+        println!(
+            "E037 microbench: docs={} fields={}",
+            lines.len(),
+            plan.slot_count()
+        );
+        for rep in 0..REPS {
+            println!(
+                "  rep {}: A (owned) {:>9.1} ns/doc   B (borrowed) {:>9.1} ns/doc   saving \
+                 {:>8.1} ns/doc",
+                rep + 1,
+                owned_ns_per_doc[rep],
+                borrowed_ns_per_doc[rep],
+                owned_ns_per_doc[rep] - borrowed_ns_per_doc[rep],
+            );
+        }
+        let owned_best = owned_ns_per_doc
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        let borrowed_best = borrowed_ns_per_doc
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "  best:   A (owned) {:>9.1} ns/doc   B (borrowed) {:>9.1} ns/doc   saving {:>8.1} \
+             ns/doc ({:.2}%)",
+            owned_best,
+            borrowed_best,
+            owned_best - borrowed_best,
+            100.0 * (owned_best - borrowed_best) / owned_best,
+        );
+        println!(
+            "  allocations: A (owned) {:.1}/doc   B (borrowed) {:.1}/doc   saving {:.1}/doc",
+            owned_allocs as f64 / docs,
+            borrowed_allocs as f64 / docs,
+            (owned_allocs as f64 - borrowed_allocs as f64) / docs,
+        );
+    }
 }

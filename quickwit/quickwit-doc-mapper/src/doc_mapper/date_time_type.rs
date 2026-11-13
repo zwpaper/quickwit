@@ -125,6 +125,42 @@ impl QuickwitDateTimeOptions {
         Ok(TantivyValue::Date(date_time))
     }
 
+    /// The borrowed-input sibling of [`QuickwitDateTimeOptions::parse_json`]: it accepts
+    /// the same values and returns the same error messages, but reads a
+    /// `serde_json_borrow::Value` and returns the datetime itself so the caller can use
+    /// `TantivyDocument::add_date`.
+    pub(crate) fn parse_borrowed_json(
+        &self,
+        json_value: &serde_json_borrow::Value,
+    ) -> Result<TantivyDateTime, String> {
+        let date_time = match json_value {
+            serde_json_borrow::Value::Number(timestamp) => {
+                // `.as_f64()` actually converts floats to integers, so we must check for
+                // integers first.
+                if let Some(timestamp_i64) = timestamp.as_i64() {
+                    quickwit_datetime::parse_timestamp_int(timestamp_i64, &self.input_formats.0)?
+                } else if let Some(timestamp_f64) = timestamp.as_f64() {
+                    quickwit_datetime::parse_timestamp_float(timestamp_f64, &self.input_formats.0)?
+                } else {
+                    return Err(format!(
+                        "failed to parse datetime `{:?}`: value is larger than i64::MAX",
+                        serde_json::Number::from(*timestamp)
+                    ));
+                }
+            }
+            serde_json_borrow::Value::Str(date_time_str) => {
+                quickwit_datetime::parse_date_time_str(date_time_str, &self.input_formats.0)?
+            }
+            _ => {
+                return Err(format!(
+                    "failed to parse datetime: expected a float, integer, or string, got \
+                     `{json_value}`"
+                ));
+            }
+        };
+        Ok(date_time)
+    }
+
     pub(crate) fn reparse_tantivy_value(
         &self,
         tantivy_value: &TantivyValue,

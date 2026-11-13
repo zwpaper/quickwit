@@ -20,14 +20,21 @@
 //! slots and materializes the Tantivy document in the legacy lexical field order,
 //! installing the grouped sidecar the inverted-index plugin reads.
 //!
+//! Values are staged in their borrowed, leaf-typed form ([`serde_json_borrow::Value`])
+//! and emitted with the leaf-typed `TantivyDocument::add_*` constructors, so an
+//! escape-free string value is never copied into an owned `String`/`JsonValue` and never
+//! converted through `OwnedValue::as_value`.
+//!
 //! Eligibility is a property of the *configuration* (see `DocMapper::fast_json_plan`),
 //! never of the input, so an unsupported document is routed to the legacy path before
 //! any parsing happens — the input is never parsed twice.
 
 use fnv::FnvHashMap;
-use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::Deserializer;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+#[cfg(test)]
 use serde_json::Value as JsonValue;
+use serde_json_borrow::Value as BorrowedJsonValue;
 use tantivy::TantivyDocument as Document;
 
 use super::mapping_tree::{MappingLeaf, MappingNode};
@@ -93,17 +100,18 @@ impl FastJsonPlan {
         })
     }
 
-    /// Decodes `bytes` into a Tantivy document.
+    /// Decodes `bytes` into a Tantivy document, staging each mapped value in its
+    /// borrowed leaf-typed form.
     ///
-    /// Preserves the legacy accepted values (the leaf conversion is reused verbatim),
-    /// last-key-wins semantics, JSON-syntax-before-schema error precedence, the legacy
-    /// lexical mapping-error order and the legacy lexical root order.
-    pub(crate) fn decode(
+    /// Preserves the legacy accepted values, last-key-wins semantics,
+    /// JSON-syntax-before-schema error precedence, the legacy lexical mapping-error order
+    /// and the legacy lexical root order.
+    pub(crate) fn decode<'de>(
         &self,
-        bytes: &[u8],
+        bytes: &'de [u8],
         strict: bool,
     ) -> Result<(u64, Document), FastJsonError> {
-        let mut slots: Vec<Option<JsonValue>> = vec![None; self.slots.len()];
+        let mut slots: Vec<Option<BorrowedJsonValue<'de>>> = vec![None; self.slots.len()];
         let mut smallest_unknown: Option<String> = None;
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         RootSeed {
@@ -118,11 +126,62 @@ impl FastJsonPlan {
         deserializer.end().map_err(FastJsonError::Json)?;
 
         let mut document = Document::new();
-        let mut path: Vec<String> = Vec::new();
         for &slot_idx in &self.lexical_slots {
             let slot = &self.slots[slot_idx];
             // A strict-mode unknown field errors at its lexical position, before any
             // field that sorts after it, matching the legacy BTreeMap walk.
+            if let Some(unknown) = &smallest_unknown {
+                if unknown.as_str() < slot.name.as_str() {
+                    return Err(FastJsonError::Schema(DocParsingError::NoSuchFieldInSchema(
+                        unknown.clone(),
+                    )));
+                }
+            }
+            let Some(value) = slots[slot_idx].take() else {
+                continue;
+            };
+            slot.leaf
+                .doc_from_borrowed_json_value(value, &mut document, &slot.name, strict)
+                .map_err(FastJsonError::Schema)?;
+        }
+        if let Some(unknown) = smallest_unknown {
+            return Err(FastJsonError::Schema(DocParsingError::NoSuchFieldInSchema(
+                unknown,
+            )));
+        }
+        // Values were emitted field by field in document order, so the grouped sidecar
+        // is built from them without a per-document comparison sort.
+        document.seal_groups();
+        Ok((0u64, document))
+    }
+
+    /// The owned-staging decoder this change replaces, kept for the pre-check
+    /// micro-benchmark that measures the borrowed decoder against it. Production only
+    /// compiles [`FastJsonPlan::decode`].
+    #[cfg(test)]
+    pub(crate) fn decode_owned(
+        &self,
+        bytes: &[u8],
+        strict: bool,
+    ) -> Result<(u64, Document), FastJsonError> {
+        let mut slots: Vec<Option<JsonValue>> = vec![None; self.slots.len()];
+        let mut smallest_unknown: Option<String> = None;
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        OwnedRootSeed {
+            plan: self,
+            strict,
+            slots: &mut slots,
+            smallest_unknown: &mut smallest_unknown,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(FastJsonError::Json)?;
+        // Reject trailing non-whitespace, exactly like `serde_json::from_slice`.
+        deserializer.end().map_err(FastJsonError::Json)?;
+
+        let mut document = Document::new();
+        let mut path: Vec<String> = Vec::new();
+        for &slot_idx in &self.lexical_slots {
+            let slot = &self.slots[slot_idx];
             if let Some(unknown) = &smallest_unknown {
                 if unknown.as_str() < slot.name.as_str() {
                     return Err(FastJsonError::Schema(DocParsingError::NoSuchFieldInSchema(
@@ -144,21 +203,25 @@ impl FastJsonPlan {
                 unknown,
             )));
         }
-        // Values were emitted field by field in document order, so the grouped sidecar
-        // is built from them without a per-document comparison sort.
         document.seal_groups();
         Ok((0u64, document))
     }
+
+    /// The number of schema slots in the plan (the flat field count).
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
 }
 
-struct RootSeed<'a> {
+struct RootSeed<'a, 'de> {
     plan: &'a FastJsonPlan,
     strict: bool,
-    slots: &'a mut Vec<Option<JsonValue>>,
+    slots: &'a mut Vec<Option<BorrowedJsonValue<'de>>>,
     smallest_unknown: &'a mut Option<String>,
 }
 
-impl<'de> DeserializeSeed<'de> for RootSeed<'_> {
+impl<'de> DeserializeSeed<'de> for RootSeed<'_, 'de> {
     type Value = ();
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
@@ -171,14 +234,14 @@ impl<'de> DeserializeSeed<'de> for RootSeed<'_> {
     }
 }
 
-struct RootVisitor<'a> {
+struct RootVisitor<'a, 'de> {
     plan: &'a FastJsonPlan,
     strict: bool,
-    slots: &'a mut Vec<Option<JsonValue>>,
+    slots: &'a mut Vec<Option<BorrowedJsonValue<'de>>>,
     smallest_unknown: &'a mut Option<String>,
 }
 
-impl<'de> Visitor<'de> for RootVisitor<'_> {
+impl<'de> Visitor<'de> for RootVisitor<'_, 'de> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -190,12 +253,76 @@ impl<'de> Visitor<'de> for RootVisitor<'_> {
             match self.plan.name_to_slot.get(&key) {
                 Some(&slot_idx) => {
                     // Last key wins, like the legacy `serde_json::Map` insert.
-                    self.slots[slot_idx] = Some(map.next_value::<JsonValue>()?);
+                    self.slots[slot_idx] = Some(map.next_value::<BorrowedJsonValue<'de>>()?);
                 }
                 None => {
                     // The value is unmapped; skip it without allocating. In strict mode
                     // remember the lexically smallest unknown key and raise it during
                     // emission, so the error order matches the legacy walk.
+                    map.next_value::<IgnoredAny>()?;
+                    if self.strict {
+                        let is_smaller = match self.smallest_unknown.as_ref() {
+                            Some(current) => key < *current,
+                            None => true,
+                        };
+                        if is_smaller {
+                            *self.smallest_unknown = Some(key);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The owned-staging visitor of [`FastJsonPlan::decode_owned`], kept only for the
+/// pre-check micro-benchmark.
+#[cfg(test)]
+struct OwnedRootSeed<'a> {
+    plan: &'a FastJsonPlan,
+    strict: bool,
+    slots: &'a mut Vec<Option<JsonValue>>,
+    smallest_unknown: &'a mut Option<String>,
+}
+
+#[cfg(test)]
+impl<'de> DeserializeSeed<'de> for OwnedRootSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(OwnedRootVisitor {
+            plan: self.plan,
+            strict: self.strict,
+            slots: self.slots,
+            smallest_unknown: self.smallest_unknown,
+        })
+    }
+}
+
+#[cfg(test)]
+struct OwnedRootVisitor<'a> {
+    plan: &'a FastJsonPlan,
+    strict: bool,
+    slots: &'a mut Vec<Option<JsonValue>>,
+    smallest_unknown: &'a mut Option<String>,
+}
+
+#[cfg(test)]
+impl<'de> Visitor<'de> for OwnedRootVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            match self.plan.name_to_slot.get(&key) {
+                Some(&slot_idx) => {
+                    self.slots[slot_idx] = Some(map.next_value::<JsonValue>()?);
+                }
+                None => {
                     map.next_value::<IgnoredAny>()?;
                     if self.strict {
                         let is_smaller = match self.smallest_unknown.as_ref() {
