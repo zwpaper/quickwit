@@ -2682,6 +2682,13 @@ mod tests {
             r#"{"a_multi": ["a", null, "b"]}"#,
             r#"{"a_multi": "solo"}"#,
             r#"{}"#,
+            // Escaped keys: an escaped field name must resolve like the plain one, and an
+            // escaped duplicate must keep last-key-wins.
+            r#"{"a_\u0074ext": "hi"}"#,
+            r#"{"a_text": "x", "a_\u0074ext": "y"}"#,
+            r#"{"a_i64": 1, "a_\u0062ool": true}"#,
+            r#"{"a_text": "ok", "a\"quote": 1, "a_i64": 2}"#,
+            r#"{"a_text": "ok", "\u00e9": 1}"#,
         ];
         for case in valid {
             assert_same(&strict, str::as_bytes(case));
@@ -2699,6 +2706,9 @@ mod tests {
             r#"{"a_i64": 1, "zzz_unknown": 2}"#,
             r#"{"a_text": "ok", "zzz_unknown": 2, "a_i64": "bad"}"#,
             r#"{"aaa_unknown": 1, "a_text": "ok"}"#,
+            // Escaped unknown keys keep the legacy lexical error order.
+            r#"{"a_\u0074ext": "x", "\u0041aa": 1}"#,
+            r#"{"zzz\u0041": 1, "a_text": "x"}"#,
         ];
         for case in errors {
             assert_same(&strict, str::as_bytes(case));
@@ -2752,5 +2762,227 @@ mod tests {
         )
         .unwrap();
         assert!(flat.supports_fast_json());
+    }
+
+    /// A fingerprint collision between two field names must decline the borrowed-key plan
+    /// (it cannot tell them apart), and a fingerprint collision between an unknown input
+    /// key and a mapped field must be rejected by the name check, not mis-mapped.
+    #[test]
+    fn test_fast_json_plan_declines_on_fingerprint_collision() {
+        use crate::doc_mapper::fast_json::FastJsonPlan;
+
+        let mapper: DocMapper = serde_json::from_str(
+            r#"{"mode": "strict", "field_mappings": [
+                {"name": "a_text", "type": "text"},
+                {"name": "b_text", "type": "text"}
+            ]}"#,
+        )
+        .unwrap();
+
+        // The real fingerprint is injective over these names: the plan is built.
+        assert!(FastJsonPlan::build(&mapper.field_mappings).is_some());
+        // A fingerprint that maps both field names to one value must decline the plan.
+        assert!(FastJsonPlan::build_with(&mapper.field_mappings, |_| 0).is_none());
+
+        // Injective over the field names but colliding for an unknown input key: the name
+        // check must reject the unknown key instead of mapping it to `a_text`.
+        let fingerprint = |name: &str| match name {
+            "a_text" => 1,
+            "b_text" => 2,
+            "zzz_unknown" => 1,
+            _ => 3,
+        };
+        let plan = FastJsonPlan::build_with(&mapper.field_mappings, fingerprint).unwrap();
+        assert!(plan.resolve_with("a_text", fingerprint).is_some());
+        assert!(plan.resolve_with("b_text", fingerprint).is_some());
+        assert_eq!(plan.resolve_with("zzz_unknown", fingerprint), None);
+        assert_eq!(plan.resolve_with("other", fingerprint), None);
+    }
+
+    /// Cheap pre-check micro-bench (E034): the borrowed-key seed probing the precomputed
+    /// fingerprint index vs. the previous `next_key::<String>` + `FnvHashMap<String, usize>`.
+    /// Reads real diverse-subset lines from `E034_BENCH_LINES` (default limit 200k) and
+    /// prints ns/doc and ns/key for both variants. Ignored unless that env var is set.
+    #[test]
+    #[ignore = "pre-check micro-bench: set E034_BENCH_LINES"]
+    fn test_fast_json_key_microbench() {
+        use std::time::Instant;
+
+        use serde::Deserializer as _;
+
+        use crate::doc_mapper::fast_json::{FastJsonPlan, KeySeed};
+
+        let Ok(path) = std::env::var("E034_BENCH_LINES") else {
+            eprintln!("E034_BENCH_LINES not set; skipping");
+            return;
+        };
+        let limit: usize = std::env::var("E034_BENCH_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let raw = std::fs::read(&path).unwrap();
+        let lines: Vec<&[u8]> = raw
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .take(limit)
+            .collect();
+
+        // The field names come from the first line; the mapper mirrors the flat ClickBench
+        // schema with one `json` leaf per key, so every key in the data is a mapped field.
+        let first: serde_json::Map<String, JsonValue> = serde_json::from_slice(lines[0]).unwrap();
+        let names: Vec<String> = first.keys().cloned().collect();
+        let fields: Vec<JsonValue> = names
+            .iter()
+            .map(|name| json!({"name": name, "type": "json"}))
+            .collect();
+        let mapper: DocMapper = serde_json::from_value(json!({
+            "mode": "strict",
+            "field_mappings": fields,
+        }))
+        .unwrap();
+        assert!(mapper.supports_fast_json());
+        let plan = mapper.fast_json_plan().unwrap();
+
+        let mut name_to_slot: fnv::FnvHashMap<String, usize> = fnv::FnvHashMap::default();
+        for (idx, name) in names.iter().enumerate() {
+            name_to_slot.insert(name.clone(), idx);
+        }
+
+        struct StringKeyVisitor<'a> {
+            name_to_slot: &'a fnv::FnvHashMap<String, usize>,
+            smallest_unknown: &'a mut Option<String>,
+            resolved: &'a mut u64,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for StringKeyVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                while let Some(key) = map.next_key::<String>()? {
+                    if self.name_to_slot.contains_key(&key) {
+                        *self.resolved += 1;
+                    } else {
+                        let is_smaller = match self.smallest_unknown.as_ref() {
+                            Some(current) => key < *current,
+                            None => true,
+                        };
+                        if is_smaller {
+                            *self.smallest_unknown = Some(key);
+                        }
+                    }
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(())
+            }
+        }
+
+        struct BorrowedKeyVisitor<'a> {
+            plan: &'a FastJsonPlan,
+            smallest_unknown: &'a mut Option<String>,
+            resolved: &'a mut u64,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for BorrowedKeyVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                loop {
+                    let Some(resolved) = map.next_key_seed(KeySeed {
+                        plan: self.plan,
+                        strict: true,
+                        smallest_unknown: &mut *self.smallest_unknown,
+                    })?
+                    else {
+                        break;
+                    };
+                    if resolved.is_some() {
+                        *self.resolved += 1;
+                    }
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(())
+            }
+        }
+
+        fn run_string_keys(lines: &[&[u8]], name_to_slot: &fnv::FnvHashMap<String, usize>) -> u64 {
+            let mut resolved = 0u64;
+            for line in lines {
+                let mut smallest_unknown: Option<String> = None;
+                let mut de = serde_json::Deserializer::from_slice(line);
+                de.deserialize_map(StringKeyVisitor {
+                    name_to_slot,
+                    smallest_unknown: &mut smallest_unknown,
+                    resolved: &mut resolved,
+                })
+                .unwrap();
+            }
+            resolved
+        }
+
+        fn run_borrowed_keys(lines: &[&[u8]], plan: &FastJsonPlan) -> u64 {
+            let mut resolved = 0u64;
+            for line in lines {
+                let mut smallest_unknown: Option<String> = None;
+                let mut de = serde_json::Deserializer::from_slice(line);
+                de.deserialize_map(BorrowedKeyVisitor {
+                    plan,
+                    smallest_unknown: &mut smallest_unknown,
+                    resolved: &mut resolved,
+                })
+                .unwrap();
+            }
+            resolved
+        }
+
+        // Both variants must resolve the same keys, or the timing is meaningless.
+        assert_eq!(
+            run_string_keys(&lines, &name_to_slot),
+            run_borrowed_keys(&lines, plan)
+        );
+
+        // Warm up, then take the best of three interleaved rounds of each variant.
+        let warmup = &lines[..lines.len().min(2_000)];
+        run_string_keys(warmup, &name_to_slot);
+        run_borrowed_keys(warmup, plan);
+        let mut string_secs = f64::INFINITY;
+        let mut borrowed_secs = f64::INFINITY;
+        for _ in 0..3 {
+            let start = Instant::now();
+            run_string_keys(&lines, &name_to_slot);
+            string_secs = string_secs.min(start.elapsed().as_secs_f64());
+            let start = Instant::now();
+            run_borrowed_keys(&lines, plan);
+            borrowed_secs = borrowed_secs.min(start.elapsed().as_secs_f64());
+        }
+
+        let docs = lines.len() as f64;
+        let keys_per_doc = run_borrowed_keys(&lines, plan) as f64 / docs;
+        let ns_per_doc_a = string_secs * 1e9 / docs;
+        let ns_per_doc_b = borrowed_secs * 1e9 / docs;
+        println!(
+            "E034 microbench: docs={docs:.0} fields={} keys/doc={keys_per_doc:.1}",
+            names.len()
+        );
+        println!(
+            "  variant A (String key):   {ns_per_doc_a:>8.1} ns/doc  {:>7.2} ns/key",
+            ns_per_doc_a / keys_per_doc
+        );
+        println!(
+            "  variant B (borrowed key): {ns_per_doc_b:>8.1} ns/doc  {:>7.2} ns/key",
+            ns_per_doc_b / keys_per_doc
+        );
+        println!(
+            "  saving: {:>8.1} ns/doc  {:>7.2} ns/key",
+            ns_per_doc_a - ns_per_doc_b,
+            (ns_per_doc_a - ns_per_doc_b) / keys_per_doc
+        );
     }
 }
