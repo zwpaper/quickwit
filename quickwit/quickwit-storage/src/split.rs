@@ -102,6 +102,13 @@ impl PutPayload for SplitPayload {
     }
 }
 
+/// Read buffer size used when streaming a split file to the storage.
+///
+/// The smithy default is 4 KiB, which drives a multi-GB split upload through hundreds of
+/// thousands of `read`+`spawn_blocking` round-trips. `Length::Exact`/`offset` still bound the
+/// range and the uploaded bytes are unchanged.
+const SPLIT_UPLOAD_READ_BUFFER_SIZE: usize = 1 << 20;
+
 #[derive(Clone)]
 struct FilePayload {
     len: u64,
@@ -119,7 +126,9 @@ impl PutPayload for FilePayload {
         assert!(range.end <= self.len);
 
         let len = range.end - range.start;
-        let mut fs_builder = FsBuilder::new().path(&self.path);
+        let mut fs_builder = FsBuilder::new()
+            .path(&self.path)
+            .buffer_size(SPLIT_UPLOAD_READ_BUFFER_SIZE);
 
         if range.start > 0 {
             fs_builder = fs_builder.offset(range.start);
@@ -453,6 +462,40 @@ mod tests {
             vec![1..2]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_payload_reads_with_split_upload_buffer() -> anyhow::Result<()> {
+        // A 4 MiB file read through the 1 MiB buffer must arrive as 4 frames of exactly
+        // `SPLIT_UPLOAD_READ_BUFFER_SIZE` bytes. With smithy's 4 KiB default the same file would
+        // arrive as 1024 frames, i.e. ~256x more `read`+`spawn_blocking` round-trips.
+        const FILE_LEN: u64 = 4 * 1024 * 1024;
+
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("split");
+        let mut file = File::create(&path)?;
+        file.write_all(&vec![0u8; FILE_LEN as usize])?;
+        drop(file);
+
+        let payload = FilePayload {
+            len: FILE_LEN,
+            path,
+        };
+        let mut stream = payload.range_byte_stream(0..FILE_LEN).await?;
+
+        let first_frame = stream.next().await.unwrap()?;
+        assert_eq!(first_frame.len(), SPLIT_UPLOAD_READ_BUFFER_SIZE);
+
+        let mut frames = 1;
+        let mut total = first_frame.len() as u64;
+        while let Some(frame) = stream.next().await {
+            let frame = frame?;
+            frames += 1;
+            total += frame.len() as u64;
+        }
+        assert_eq!(total, FILE_LEN);
+        assert_eq!(frames, FILE_LEN as usize / SPLIT_UPLOAD_READ_BUFFER_SIZE);
         Ok(())
     }
 
