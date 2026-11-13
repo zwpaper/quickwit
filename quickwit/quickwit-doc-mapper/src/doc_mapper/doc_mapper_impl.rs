@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, bail};
 use fnv::FnvHashSet;
@@ -30,6 +30,7 @@ use tantivy::query::Query;
 use tantivy::schema::{Field, FieldType, INDEXED, OwnedValue as TantivyValue, STORED, Schema};
 
 use super::DocMapperBuilder;
+use super::fast_json::{FastJsonError, FastJsonPlan};
 use super::field_mapping_entry::RAW_TOKENIZER_NAME;
 use super::field_presence::populate_field_presence;
 use super::tantivy_val_to_json::tantivy_value_to_json;
@@ -96,6 +97,9 @@ pub struct DocMapper {
     tokenizer_entries: Vec<TokenizerEntry>,
     /// Tokenizer manager.
     tokenizer_manager: TokenizerManager,
+    /// Lazily built plan for the schema-guided fast JSON path. `None` when this mapper's
+    /// configuration is not supported by the flat fast path.
+    fast_json_plan: OnceLock<Option<FastJsonPlan>>,
 }
 
 fn validate_timestamp_field(
@@ -297,6 +301,7 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
             mode: doc_mapping.mode,
             tokenizer_entries: doc_mapping.tokenizers,
             tokenizer_manager,
+            fast_json_plan: OnceLock::new(),
         })
     }
 }
@@ -463,6 +468,52 @@ impl DocMapper {
             };
         }
         Ok(())
+    }
+
+    /// The flat-schema decoding plan, or `None` when this mapper's configuration is not
+    /// supported by the fast path (nested mappings, dynamic mode, source storage, routing,
+    /// concatenation, field presence or a document-size field).
+    ///
+    /// Eligibility depends only on the configuration, so a caller can pick the fast path
+    /// before reading a single input byte.
+    fn fast_json_plan(&self) -> Option<&FastJsonPlan> {
+        self.fast_json_plan
+            .get_or_init(|| self.build_fast_json_plan())
+            .as_ref()
+    }
+
+    fn build_fast_json_plan(&self) -> Option<FastJsonPlan> {
+        if self.mode.mode_type() == ModeType::Dynamic
+            || self.source_field.is_some()
+            || self.dynamic_field.is_some()
+            || self.document_size_field.is_some()
+            || self.index_field_presence
+            || !self.concatenate_dynamic_fields.is_empty()
+            || !self.partition_key.is_empty()
+        {
+            return None;
+        }
+        FastJsonPlan::build(&self.field_mappings)
+    }
+
+    /// Whether [`DocMapper::doc_from_json_bytes_fast`] can decode a document for this mapper.
+    pub fn supports_fast_json(&self) -> bool {
+        self.fast_json_plan().is_some()
+    }
+
+    /// Decodes one ordinary JSON document straight into a Tantivy document.
+    ///
+    /// Call only when [`DocMapper::supports_fast_json`] is `true`; an unsupported
+    /// configuration stays on the legacy path, so the input is never parsed twice.
+    pub fn doc_from_json_bytes_fast(
+        &self,
+        json_doc: &[u8],
+    ) -> Result<(Partition, Document), FastJsonError> {
+        let plan = self
+            .fast_json_plan()
+            .expect("doc_from_json_bytes_fast requires a supported mapper");
+        let strict = self.mode.mode_type() == ModeType::Strict;
+        plan.decode(json_doc, strict)
     }
 
     /// Parses a JSON byte slice into a tantivy [`Document`].
@@ -2550,5 +2601,156 @@ mod tests {
         let new_mapper = builder.try_build().unwrap();
 
         assert_eq!(new_mapper.doc_to_json(named_doc.0).unwrap(), doc);
+    }
+
+    /// The fast decoder must accept, reject and materialize exactly what the legacy
+    /// `serde_json::Map` walk does: same values, same last-key-wins, same legacy lexical
+    /// root order and the same error category and precedence.
+    #[test]
+    fn test_fast_json_decoder_matches_legacy_map_walk() {
+        use tantivy::TantivyDocument as Document;
+        use tantivy::schema::Field;
+
+        use crate::doc_mapper::{FastJsonError, JsonObject};
+
+        #[derive(Debug, PartialEq)]
+        enum Decoded {
+            Ok(u64, Vec<(Field, OwnedValue)>),
+            JsonError,
+            SchemaError(DocParsingError),
+        }
+
+        fn ordered(doc: &Document) -> Vec<(Field, OwnedValue)> {
+            doc.field_values()
+                .map(|(field, value)| (field, OwnedValue::from(value)))
+                .collect()
+        }
+
+        fn legacy_outcome(mapper: &DocMapper, bytes: &[u8]) -> Decoded {
+            let Ok(json_obj) = serde_json::from_slice::<JsonObject>(bytes) else {
+                return Decoded::JsonError;
+            };
+            match mapper.doc_from_json_obj(json_obj, bytes.len() as u64) {
+                Ok((partition, doc)) => Decoded::Ok(partition, ordered(&doc)),
+                Err(error) => Decoded::SchemaError(error),
+            }
+        }
+
+        fn fast_outcome(mapper: &DocMapper, bytes: &[u8]) -> Decoded {
+            match mapper.doc_from_json_bytes_fast(bytes) {
+                Ok((partition, doc)) => Decoded::Ok(partition, ordered(&doc)),
+                Err(FastJsonError::Json(_)) => Decoded::JsonError,
+                Err(FastJsonError::Schema(error)) => Decoded::SchemaError(error),
+            }
+        }
+
+        fn assert_same(mapper: &DocMapper, bytes: &[u8]) {
+            assert_eq!(
+                legacy_outcome(mapper, bytes),
+                fast_outcome(mapper, bytes),
+                "mismatch for {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+
+        let strict: DocMapper = serde_json::from_str(
+            r#"{
+                "mode": "strict",
+                "field_mappings": [
+                    {"name": "a_bool", "type": "bool"},
+                    {"name": "a_bytes", "type": "bytes", "input_format": "base64"},
+                    {"name": "a_date", "type": "datetime", "input_formats": ["%Y-%m-%d %H:%M:%S", "unix_timestamp"]},
+                    {"name": "a_f64", "type": "f64"},
+                    {"name": "a_i64", "type": "i64", "coerce": true},
+                    {"name": "a_ip", "type": "ip"},
+                    {"name": "a_multi", "type": "text"},
+                    {"name": "a_text", "type": "text"},
+                    {"name": "a_u64", "type": "u64"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(strict.supports_fast_json());
+
+        let valid: &[&str] = &[
+            r#"{"a_i64": 5, "a_text": "hi", "a_u64": 7, "a_f64": 1.5, "a_bool": true, "a_date": "2023-01-02 03:04:05", "a_ip": "1.2.3.4", "a_bytes": "aGk=", "a_multi": ["x", "y"]}"#,
+            r#"{"a_text": "x", "a_text": "y"}"#,
+            r#"{"a_text": null, "a_i64": 1}"#,
+            r#"{"a_i64": "42"}"#,
+            r#"{"a_u64": 12, "a_f64": 3, "a_bool": false}"#,
+            r#"{"a_date": 1586960586}"#,
+            r#"{"a_multi": ["a", null, "b"]}"#,
+            r#"{"a_multi": "solo"}"#,
+            r#"{}"#,
+        ];
+        for case in valid {
+            assert_same(&strict, str::as_bytes(case));
+        }
+
+        // Value errors, unknown fields and their lexical precedence.
+        let errors: &[&str] = &[
+            r#"{"a_i64": 1.5}"#,
+            r#"{"a_text": 5}"#,
+            r#"{"a_bool": 1}"#,
+            r#"{"a_ip": "nope"}"#,
+            r#"{"a_date": "not a date"}"#,
+            r#"{"a_bytes": "!!not base64!!"}"#,
+            r#"{"a_multi": [1]}"#,
+            r#"{"a_i64": 1, "zzz_unknown": 2}"#,
+            r#"{"a_text": "ok", "zzz_unknown": 2, "a_i64": "bad"}"#,
+            r#"{"aaa_unknown": 1, "a_text": "ok"}"#,
+        ];
+        for case in errors {
+            assert_same(&strict, str::as_bytes(case));
+        }
+
+        // JSON syntax / shape errors take precedence over schema errors.
+        let json_errors: &[&str] = &[
+            "not json",
+            "[1, 2]",
+            r#"{"a_i64": }"#,
+            r#"{"a_i64": 1} trailing"#,
+            r#"{"a_text": "unterminated}"#,
+        ];
+        for case in json_errors {
+            assert_same(&strict, str::as_bytes(case));
+        }
+
+        // Lenient mode ignores unknown fields.
+        let lenient: DocMapper = serde_json::from_str(
+            r#"{"mode": "lenient", "field_mappings": [{"name": "a_text", "type": "text"}]}"#,
+        )
+        .unwrap();
+        assert!(lenient.supports_fast_json());
+        assert_same(&lenient, br#"{"a_text": "x", "zzz_unknown": 1}"#);
+        assert_same(&lenient, br#"{"a_text": "x", "a_text": "y", "zzz": 1}"#);
+    }
+
+    /// A configuration the fast path does not model keeps the legacy walk.
+    #[test]
+    fn test_fast_json_path_eligibility() {
+        let dynamic: DocMapper = serde_json::from_str(
+            r#"{"mode": "dynamic", "field_mappings": [{"name": "a_text", "type": "text"}]}"#,
+        )
+        .unwrap();
+        assert!(!dynamic.supports_fast_json());
+
+        let nested: DocMapper = serde_json::from_str(
+            r#"{"mode": "strict", "field_mappings": [{"name": "a_obj", "type": "object", "field_mappings": [{"name": "b", "type": "text"}]}]}"#,
+        )
+        .unwrap();
+        assert!(!nested.supports_fast_json());
+
+        let source: DocMapper = serde_json::from_str(
+            r#"{"mode": "strict", "store_source": true, "field_mappings": [{"name": "a_text", "type": "text"}]}"#,
+        )
+        .unwrap();
+        assert!(!source.supports_fast_json());
+
+        let flat: DocMapper = serde_json::from_str(
+            r#"{"mode": "strict", "field_mappings": [{"name": "a_text", "type": "text"}]}"#,
+        )
+        .unwrap();
+        assert!(flat.supports_fast_json());
     }
 }
