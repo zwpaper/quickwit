@@ -89,6 +89,7 @@ pub struct IndexerCounters {
 }
 
 struct IndexerState {
+    two_lane_opt: Option<Arc<super::two_lane::TwoLane>>,
     pipeline_id: IndexingPipelineId,
     metastore: MetastoreServiceClient,
     indexing_directory: TempDirectory,
@@ -237,6 +238,7 @@ impl IndexerState {
             _indexing_span: indexing_span,
             indexed_splits: FnvHashMap::with_capacity_and_hasher(250, Default::default()),
             other_indexed_split_opt: None,
+            secondary_split_opt: None,
             checkpoint_delta,
             publish_lock,
             last_delete_opstamp,
@@ -284,6 +286,7 @@ impl IndexerState {
             checkpoint_delta,
             indexed_splits,
             other_indexed_split_opt,
+            secondary_split_opt,
             publish_lock,
             last_delete_opstamp,
             memory_usage,
@@ -302,6 +305,55 @@ impl IndexerState {
             .context("batch delta does not follow indexer checkpoint")?;
         let mut memory_usage_delta: i64 = 0;
         counters.num_doc_batches_in_workbench += 1;
+        if let Some(lanes) = &self.two_lane_opt {
+            let mut left = batch.docs;
+            if left.is_empty() {
+                return Ok(());
+            }
+            let partition = left[0].partition;
+            left.iter()
+                .all(|doc| doc.partition == partition)
+                .then_some(())
+                .context("E050 does not support routed documents")?;
+            counters.num_docs_in_workbench += left.len() as u64;
+            let right = left.split_off(left.len().div_ceil(2));
+            let (primary, created) = self.get_or_create_indexed_split(
+                partition,
+                *last_delete_opstamp,
+                indexed_splits,
+                other_indexed_split_opt,
+                counters,
+                ctx,
+            )?;
+            if created {
+                memory_usage_delta += primary.mem_usage() as i64;
+            }
+            let _guard = ctx.protect_zone();
+            if right.is_empty() {
+                memory_usage_delta += index_documents_in_split(primary, left)?;
+            } else {
+                if secondary_split_opt.is_none() {
+                    let split =
+                        self.create_indexed_split_builder(partition, *last_delete_opstamp, ctx)?;
+                    memory_usage_delta += split.mem_usage() as i64;
+                    *secondary_split_opt = Some(split);
+                }
+                let secondary = secondary_split_opt.as_mut().unwrap();
+                (secondary.split_attrs.partition_id == partition)
+                    .then_some(())
+                    .context("E050 partition changed across batches")?;
+                let (first_result, second_result) = lanes.join(
+                    || index_documents_in_split(primary, left),
+                    || index_documents_in_split(secondary, right),
+                );
+                // join completed both writes before propagating either error. The actor fails,
+                // rather than publish a partially mutated group or retry a document in-place.
+                memory_usage_delta += first_result? + second_result?;
+            }
+            memory_usage.increment(memory_usage_delta as f64);
+            ctx.record_progress();
+            return Ok(());
+        }
         for doc in batch.docs {
             let ProcessedDoc {
                 doc,
@@ -349,6 +401,31 @@ impl IndexerState {
     }
 }
 
+// E050: a lane exclusively owns its writer during this synchronous batch operation.
+// No worker can outlive the actor's batch, commit fence, or publish-lock generation.
+fn index_documents_in_split(
+    split: &mut IndexedSplitBuilder,
+    docs: Vec<ProcessedDoc>,
+) -> anyhow::Result<i64> {
+    let before = split.mem_usage() as i64;
+    for processed in docs {
+        split.split_attrs.uncompressed_docs_size_in_bytes += processed.num_bytes as u64;
+        let doc_id = split.split_attrs.num_docs as DocId;
+        split.split_attrs.num_docs += 1;
+        if let Some(clusterer) = split.doc_id_clusterer_opt.as_mut() {
+            clusterer.push(processed.fingerprint_opt, doc_id);
+        }
+        if let Some(timestamp) = processed.timestamp_opt {
+            record_timestamp(timestamp, &mut split.split_attrs.time_range);
+        }
+        split
+            .index_writer
+            .add_document(processed.doc)
+            .context("failed to add document")?;
+    }
+    Ok(split.mem_usage() as i64 - before)
+}
+
 /// A workbench hosts the set of `IndexedSplit` that are being built.
 struct IndexingWorkbench {
     workbench_id: Ulid,
@@ -359,6 +436,7 @@ struct IndexingWorkbench {
 
     indexed_splits: FnvHashMap<u64, IndexedSplitBuilder>,
     other_indexed_split_opt: Option<IndexedSplitBuilder>,
+    secondary_split_opt: Option<IndexedSplitBuilder>,
 
     checkpoint_delta: IndexCheckpointDelta,
     publish_lock: PublishLock,
@@ -387,7 +465,11 @@ impl Actor for Indexer {
     }
 
     fn queue_capacity(&self) -> QueueCapacity {
-        QueueCapacity::Bounded(10)
+        QueueCapacity::Bounded(if self.indexer_state.two_lane_opt.is_some() {
+            1
+        } else {
+            10
+        })
     }
 
     fn name(&self) -> String {
@@ -526,6 +608,11 @@ impl Handler<NewPublishLock> for Indexer {
 }
 
 impl Indexer {
+    pub(super) fn with_two_lane(mut self, lanes: Option<Arc<super::two_lane::TwoLane>>) -> Self {
+        self.indexer_state.two_lane_opt = lanes;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pipeline_id: IndexingPipelineId,
@@ -561,6 +648,7 @@ impl Indexer {
             });
         Self {
             indexer_state: IndexerState {
+                two_lane_opt: None,
                 pipeline_id,
                 metastore: metastore.clone(),
                 indexing_directory,
@@ -632,6 +720,7 @@ impl Indexer {
         let Some(IndexingWorkbench {
             indexed_splits,
             other_indexed_split_opt,
+            secondary_split_opt,
             checkpoint_delta,
             publish_lock,
             batch_parent_span,
@@ -644,6 +733,9 @@ impl Indexer {
         };
 
         let mut splits: Vec<IndexedSplitBuilder> = indexed_splits.into_values().collect();
+        if let Some(secondary) = secondary_split_opt {
+            splits.push(secondary);
+        }
 
         if let Some(other_split) = other_indexed_split_opt {
             splits.push(other_split)
@@ -739,6 +831,223 @@ mod tests {
             fingerprinter_opt,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn test_e050_two_lane_commit_and_exact_documents() -> anyhow::Result<()> {
+        for serial in [true, false] {
+            let universe = Universe::new();
+            let pipeline_id = IndexingPipelineId {
+                index_uid: IndexUid::new_with_random_ulid("e050"),
+                source_id: "test-source".into(),
+                node_id: NodeId::from_str("test-node"),
+                pipeline_uid: PipelineUid::default(),
+            };
+            let mapper = Arc::new(default_doc_mapper_for_test());
+            let body = mapper.schema().get_field("body")?;
+            let (mailbox, inbox) = universe.create_test_mailbox();
+            let mut meta = MockMetastoreService::new();
+            meta.expect_publish_splits().never();
+            meta.expect_last_delete_opstamp()
+                .returning(|_| Ok(LastDeleteOpstampResponse::new(11)));
+            let mut settings = IndexingSettings::for_test();
+            settings.resources.heap_size = ByteSize::mb(100);
+            settings.split_num_docs_target = 4;
+            let indexer = create_indexer_for_test(
+                pipeline_id,
+                mapper,
+                MetastoreServiceClient::from_mock(meta),
+                TempDirectory::for_test(),
+                settings,
+                None,
+                mailbox,
+                None,
+            )
+            .with_two_lane(Some(super::super::two_lane::TwoLane::new(serial)?));
+            let (input, handle) = universe.spawn_builder().spawn(indexer);
+            for batch_id in 0..2 {
+                let docs = (batch_id * 2..batch_id * 2 + 2)
+                    .map(|id| ProcessedDoc {
+                        doc: doc!(body=>format!("id-{id}")),
+                        partition: 0,
+                        fingerprint_opt: None,
+                        timestamp_opt: None,
+                        num_bytes: 4,
+                    })
+                    .collect();
+                input
+                    .send_message(ProcessedDocBatch::new(
+                        docs,
+                        SourceCheckpointDelta::from_range(batch_id..batch_id + 1),
+                        false,
+                    ))
+                    .await?;
+            }
+            handle.process_pending_and_observe().await;
+            let mut groups: Vec<IndexedSplitBatchBuilder> = inbox.drain_for_test_typed();
+            assert_eq!(groups.len(), 1);
+            let group = groups.pop().unwrap();
+            assert_eq!(group.commit_trigger, CommitTrigger::NumDocsLimit);
+            assert_eq!(
+                group.checkpoint_delta_opt.as_ref().unwrap().source_delta,
+                SourceCheckpointDelta::from_range(0..2)
+            );
+            assert_eq!(group.splits.len(), 2);
+            let mut values = Vec::new();
+            for builder in group.splits {
+                assert_eq!(builder.split_attrs.partition_id, 0);
+                assert_eq!(builder.split_attrs.delete_opstamp, 11);
+                assert_eq!(builder.split_attrs.num_docs, 2);
+                let split = builder.finalize()?;
+                let reader = split.index.reader()?;
+                let searcher = reader.searcher();
+                assert_eq!(searcher.segment_readers().len(), 1);
+                for id in 0..2 {
+                    let doc: TantivyDocument = searcher.doc(DocAddress::new(0, id))?;
+                    values.push(doc.get_first(body).unwrap().as_str().unwrap().to_owned());
+                }
+            }
+            values.sort();
+            assert_eq!(values, ["id-0", "id-1", "id-2", "id-3"]);
+            // An error-only/empty batch must still publish its checkpoint at a force fence.
+            input
+                .send_message(ProcessedDocBatch::new(
+                    Vec::new(),
+                    SourceCheckpointDelta::from_range(2..3),
+                    true,
+                ))
+                .await?;
+            handle.process_pending_and_observe().await;
+            let empty: Vec<EmptySplit> = inbox.drain_for_test_typed();
+            assert_eq!(empty.len(), 1);
+            assert_eq!(
+                empty[0].checkpoint_delta.source_delta,
+                SourceCheckpointDelta::from_range(2..3)
+            );
+            universe.send_exit_with_success(&input).await?;
+            assert!(handle.join().await.0.is_success());
+            universe.assert_quit().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_e050_force_timeout_eof_memory_failure_and_lock() -> anyhow::Result<()> {
+        for case in ["force", "timeout", "eof", "memory", "failure", "lock"] {
+            let universe = Universe::new();
+            let pipeline_id = IndexingPipelineId {
+                index_uid: IndexUid::new_with_random_ulid("e050-fences"),
+                source_id: "test-source".into(),
+                node_id: NodeId::from_str("test-node"),
+                pipeline_uid: PipelineUid::default(),
+            };
+            let mapper = Arc::new(default_doc_mapper_for_test());
+            let body = mapper.schema().get_field("body")?;
+            let timestamp = mapper.schema().get_field("timestamp")?;
+            let (mailbox, inbox) = universe.create_test_mailbox();
+            let mut meta = MockMetastoreService::new();
+            meta.expect_publish_splits().never();
+            meta.expect_last_delete_opstamp()
+                .returning(|_| Ok(LastDeleteOpstampResponse::new(0)));
+            let mut settings = IndexingSettings::for_test();
+            settings.resources.heap_size = if case == "memory" {
+                ByteSize(1)
+            } else {
+                ByteSize::mb(100)
+            };
+            settings.commit_timeout_secs = if case == "timeout" { 1 } else { 60 };
+            settings.split_num_docs_target = 1000;
+            let indexer = create_indexer_for_test(
+                pipeline_id,
+                mapper,
+                MetastoreServiceClient::from_mock(meta),
+                TempDirectory::for_test(),
+                settings,
+                None,
+                mailbox,
+                None,
+            )
+            .with_two_lane(Some(super::super::two_lane::TwoLane::new(false)?));
+            let (input, handle) = universe.spawn_builder().spawn(indexer);
+            let docs = (0..4)
+                .map(|i| ProcessedDoc {
+                    doc: if case == "failure" && i == 3 {
+                        doc!(timestamp=>"not-a-date")
+                    } else {
+                        doc!(body=>format!("id-{i}"))
+                    },
+                    partition: 0,
+                    fingerprint_opt: None,
+                    timestamp_opt: None,
+                    num_bytes: 4,
+                })
+                .collect();
+            input
+                .send_message(ProcessedDocBatch::new(
+                    docs,
+                    SourceCheckpointDelta::from_range(0..4),
+                    case == "force",
+                ))
+                .await?;
+            if case == "failure" {
+                assert!(!handle.join().await.0.is_success());
+                let groups: Vec<IndexedSplitBatchBuilder> = inbox.drain_for_test_typed();
+                assert!(
+                    groups.is_empty(),
+                    "partial mutation must never be published"
+                );
+                universe.assert_quit().await;
+                continue;
+            }
+            handle.process_pending_and_observe().await;
+            if case == "timeout" {
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                handle.process_pending_and_observe().await;
+            }
+            if case == "lock" {
+                input
+                    .send_message(NewPublishLock(PublishLock::default()))
+                    .await?;
+                handle.process_pending_and_observe().await;
+            }
+            universe.send_exit_with_success(&input).await?;
+            assert!(handle.join().await.0.is_success());
+            let mut groups: Vec<IndexedSplitBatchBuilder> = inbox.drain_for_test_typed();
+            if case == "lock" {
+                assert!(
+                    groups.is_empty(),
+                    "old workbench must be discarded on lock replacement"
+                );
+            } else {
+                assert_eq!(groups.len(), 1, "case {case}");
+                let group = groups.pop().unwrap();
+                let expected_trigger = match case {
+                    "force" => CommitTrigger::ForceCommit,
+                    "timeout" => CommitTrigger::Timeout,
+                    "memory" => CommitTrigger::MemoryLimit,
+                    _ => CommitTrigger::NoMoreDocs,
+                };
+                assert_eq!(group.commit_trigger, expected_trigger);
+                assert_eq!(
+                    group.checkpoint_delta_opt.unwrap().source_delta,
+                    SourceCheckpointDelta::from_range(0..4)
+                );
+                assert_eq!(
+                    group
+                        .splits
+                        .iter()
+                        .map(|s| s.split_attrs.num_docs)
+                        .sum::<u64>(),
+                    4
+                );
+                assert_eq!(group.splits.len(), 2);
+                for split in group.splits {
+                    split.finalize()?;
+                }
+            }
+            universe.assert_quit().await;
+        }
+        Ok(())
     }
 
     #[test]
