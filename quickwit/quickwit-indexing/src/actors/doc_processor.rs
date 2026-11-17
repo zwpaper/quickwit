@@ -413,6 +413,7 @@ pub struct DocProcessor {
     /// Whether ordinary JSON documents go through the schema-guided fast decoder. Decided
     /// from the mapper configuration and the source settings, never from the input.
     fast_json_opt: bool,
+    two_lane_opt: Option<Arc<super::two_lane::TwoLane>>,
     #[cfg(feature = "vrl")]
     transform_opt: Option<VrlProgram>,
     input_format: SourceInputFormat,
@@ -446,12 +447,18 @@ impl DocProcessor {
             counters: Arc::new(DocProcessorCounters::new(index_id, source_id)),
             publish_lock: PublishLock::default(),
             fast_json_opt,
+            two_lane_opt: None,
             #[cfg(feature = "vrl")]
             transform_opt: transform_config_opt
                 .map(VrlProgram::try_from_transform_config)
                 .transpose()?,
             input_format,
         })
+    }
+
+    pub(super) fn with_two_lane(mut self, lanes: Option<Arc<super::two_lane::TwoLane>>) -> Self {
+        self.two_lane_opt = lanes;
+        self
     }
 
     // Extract a timestamp from a tantivy document.
@@ -477,7 +484,13 @@ impl DocProcessor {
     fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
         let num_bytes = raw_doc.len();
         if self.fast_json_opt {
-            self.process_raw_doc_fast(raw_doc, processed_docs);
+            Self::process_raw_doc_fast(
+                &self.doc_mapper,
+                self.timestamp_field_opt,
+                &self.counters,
+                raw_doc,
+                processed_docs,
+            );
             return;
         }
 
@@ -513,17 +526,32 @@ impl DocProcessor {
     /// The mapper is supported and no VRL transform or fingerprint is configured (see
     /// `fast_json_opt`), so the legacy parser is never entered first: the document is
     /// parsed exactly once.
-    fn process_raw_doc_fast(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
+    fn process_raw_doc_fast(
+        mapper: &DocMapper,
+        timestamp_field: Option<Field>,
+        counters: &DocProcessorCounters,
+        raw_doc: Bytes,
+        processed_docs: &mut Vec<ProcessedDoc>,
+    ) {
         let num_bytes = raw_doc.len();
-        let outcome = self
-            .doc_mapper
+        let outcome = mapper
             .doc_from_json_bytes_fast(&raw_doc)
             .map_err(|error| match error {
                 FastJsonError::Json(error) => DocProcessorError::JsonParsing(error.to_string()),
                 FastJsonError::Schema(error) => DocProcessorError::DocMapperParsing(error),
             })
             .and_then(|(partition, doc)| {
-                let timestamp_opt = self.extract_timestamp(&doc)?;
+                let timestamp_opt = timestamp_field
+                    .map(|field| {
+                        doc.get_first(field)
+                            .and_then(|value| value.as_datetime())
+                            .ok_or_else(|| {
+                                DocProcessorError::from(DocParsingError::RequiredField(
+                                    "timestamp field is required".to_string(),
+                                ))
+                            })
+                    })
+                    .transpose()?;
                 Ok(ProcessedDoc {
                     doc,
                     fingerprint_opt: None,
@@ -534,17 +562,17 @@ impl DocProcessor {
             });
         match outcome {
             Ok(processed_doc) => {
-                self.counters.record_valid(num_bytes as u64);
+                counters.record_valid(num_bytes as u64);
                 processed_docs.push(processed_doc);
             }
             Err(error) => {
                 rate_limited_warn!(
                     limit_per_min = 10,
-                    index_id = self.counters.index_id,
-                    source_id = self.counters.source_id,
+                    index_id = counters.index_id,
+                    source_id = counters.source_id,
                     "{error}",
                 );
-                self.counters.record_error(error, num_bytes as u64);
+                counters.record_error(error, num_bytes as u64);
             }
         }
     }
@@ -596,7 +624,7 @@ impl Actor for DocProcessor {
     }
 
     fn queue_capacity(&self) -> QueueCapacity {
-        QueueCapacity::Bounded(10)
+        QueueCapacity::Bounded(if self.two_lane_opt.is_some() { 1 } else { 10 })
     }
 
     fn runtime_handle(&self) -> Handle {
@@ -640,10 +668,30 @@ impl Handler<RawDocBatch> for DocProcessor {
         }
         let mut processed_docs: Vec<ProcessedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
 
-        for raw_doc in raw_doc_batch.docs {
-            let _protected_zone_guard = ctx.protect_zone();
-            self.process_raw_doc(raw_doc, &mut processed_docs);
+        if let Some(lanes) = &self.two_lane_opt {
+            let mut left = raw_doc_batch.docs;
+            let right = left.split_off(left.len().div_ceil(2));
+            let mapper = &self.doc_mapper;
+            let counters = &self.counters;
+            let timestamp_field = self.timestamp_field_opt;
+            let process = |docs: Vec<Bytes>| {
+                let mut output = Vec::with_capacity(docs.len());
+                for raw in docs {
+                    Self::process_raw_doc_fast(mapper, timestamp_field, counters, raw, &mut output);
+                }
+                output
+            };
+            let _guard = ctx.protect_zone();
+            let (mut first, second) = lanes.join(|| process(left), || process(right));
+            first.extend(second);
+            processed_docs = first;
             ctx.record_progress();
+        } else {
+            for raw_doc in raw_doc_batch.docs {
+                let _protected_zone_guard = ctx.protect_zone();
+                self.process_raw_doc(raw_doc, &mut processed_docs);
+                ctx.record_progress();
+            }
         }
         let processed_doc_batch = ProcessedDocBatch::new(
             processed_docs,
@@ -695,6 +743,91 @@ mod tests {
 
     use super::*;
     use crate::models::{PublishLock, RawDocBatch};
+
+    #[test]
+    fn test_e050_parallel_fast_parser_matches_serial() -> anyhow::Result<()> {
+        let mapper: DocMapper = serde_json::from_value(serde_json::json!({
+            "mode": "strict",
+            "field_mappings": [{"name": "id", "type": "u64"}, {"name": "body", "type": "text"}]
+        }))?;
+        assert!(mapper.supports_fast_json());
+        super::super::two_lane::TwoLane::validate(
+            &mapper,
+            SourceInputFormat::Json,
+            false,
+            false,
+            false,
+        )?;
+        assert!(
+            super::super::two_lane::TwoLane::validate(
+                &mapper,
+                SourceInputFormat::Json,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::two_lane::TwoLane::validate(
+                &mapper,
+                SourceInputFormat::PlainText,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::two_lane::TwoLane::validate(
+                &mapper,
+                SourceInputFormat::Json,
+                false,
+                false,
+                true
+            )
+            .is_err()
+        );
+        let input = [
+            r#"{"id":0,"body":"first"}"#,
+            "{invalid",
+            r#"{"id":"bad"}"#,
+            r#"{"id":3,"body":"last"}"#,
+        ];
+        let serial_counts = DocProcessorCounters::new("test".into(), "source".into());
+        let parallel_counts = DocProcessorCounters::new("test".into(), "source".into());
+        let process = |input: &[&str], counters: &DocProcessorCounters| {
+            let mut out = Vec::new();
+            for line in input {
+                DocProcessor::process_raw_doc_fast(
+                    &mapper,
+                    None,
+                    counters,
+                    Bytes::copy_from_slice(str::as_bytes(line)),
+                    &mut out,
+                );
+            }
+            out
+        };
+        let expected = process(&input, &serial_counts);
+        let pool = super::super::two_lane::TwoLane::new(false)?;
+        let (mut left, right) = pool.join(
+            || process(&input[..2], &parallel_counts),
+            || process(&input[2..], &parallel_counts),
+        );
+        left.extend(right);
+        assert_eq!(left.len(), expected.len());
+        for (actual, expected) in left.iter().zip(&expected) {
+            assert_eq!(format!("{:?}", actual.doc), format!("{:?}", expected.doc));
+            assert_eq!(actual.partition, expected.partition);
+        }
+        assert_eq!(
+            parallel_counts.num_processed_docs(),
+            serial_counts.num_processed_docs()
+        );
+        assert_eq!(parallel_counts.num_invalid_docs(), 2);
+        Ok(())
+    }
 
     fn raw_body_fingerprinter_for_test() -> Fingerprinter {
         let docs_clustering_config =

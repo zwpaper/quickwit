@@ -315,6 +315,13 @@ impl IndexingPipeline {
             r#gen=self.generation()
         ))]
     async fn spawn_pipeline(&mut self, ctx: &ActorContext<Self>) -> anyhow::Result<()> {
+        let two_lane_opt = super::two_lane::TwoLane::from_env(
+            &self.params.doc_mapper,
+            self.params.source_config.input_format,
+            self.params.source_config.transform_config.is_some(),
+            self.params.fingerprinter_opt.is_some(),
+            self.params.cooperative_indexing_permits.is_some(),
+        )?;
         let _spawn_pipeline_permit = ctx
             .protect_future(SPAWN_PIPELINE_SEMAPHORE.acquire())
             .await
@@ -407,7 +414,8 @@ impl IndexingPipeline {
             index_serializer_mailbox,
             self.params.fingerprinter_opt.clone(),
             self.params.indexing_io_throughput_limiter_opt.clone(),
-        );
+        )
+        .with_two_lane(two_lane_opt.clone());
         let (indexer_mailbox, indexer_handle) = ctx
             .spawn_actor()
             .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "indexer")]))
@@ -422,7 +430,8 @@ impl IndexingPipeline {
             self.params.source_config.transform_config.clone(),
             self.params.source_config.input_format,
             self.params.fingerprinter_opt.clone(),
-        )?;
+        )?
+        .with_two_lane(two_lane_opt);
         let (doc_processor_mailbox, doc_processor_handle) = ctx
             .spawn_actor()
             .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "doc_processor")]))

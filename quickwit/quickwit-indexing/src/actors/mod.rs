@@ -26,6 +26,7 @@ mod merge_split_downloader;
 mod packager;
 mod publisher;
 mod sequencer;
+mod two_lane;
 mod uploader;
 #[cfg(feature = "vrl")]
 mod vrl_processing;
