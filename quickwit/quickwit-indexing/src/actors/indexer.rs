@@ -238,7 +238,7 @@ impl IndexerState {
             _indexing_span: indexing_span,
             indexed_splits: FnvHashMap::with_capacity_and_hasher(250, Default::default()),
             other_indexed_split_opt: None,
-            secondary_split_opt: None,
+            additional_splits: Vec::new(),
             checkpoint_delta,
             publish_lock,
             last_delete_opstamp,
@@ -286,7 +286,7 @@ impl IndexerState {
             checkpoint_delta,
             indexed_splits,
             other_indexed_split_opt,
-            secondary_split_opt,
+            additional_splits,
             publish_lock,
             last_delete_opstamp,
             memory_usage,
@@ -306,17 +306,23 @@ impl IndexerState {
         let mut memory_usage_delta: i64 = 0;
         counters.num_doc_batches_in_workbench += 1;
         if let Some(lanes) = &self.two_lane_opt {
-            let mut left = batch.docs;
-            if left.is_empty() {
+            if batch.docs.is_empty() {
                 return Ok(());
             }
-            let partition = left[0].partition;
-            left.iter()
+            let partition = batch.docs[0].partition;
+            batch
+                .docs
+                .iter()
                 .all(|doc| doc.partition == partition)
                 .then_some(())
                 .context("E050 does not support routed documents")?;
-            counters.num_docs_in_workbench += left.len() as u64;
-            let right = left.split_off(left.len().div_ceil(2));
+            indexed_splits
+                .keys()
+                .all(|id| *id == partition)
+                .then_some(())
+                .context("E050 partition changed across batches")?;
+            counters.num_docs_in_workbench += batch.docs.len() as u64;
+            let chunks = lanes.chunks(batch.docs);
             let (primary, created) = self.get_or_create_indexed_split(
                 partition,
                 *last_delete_opstamp,
@@ -328,27 +334,22 @@ impl IndexerState {
             if created {
                 memory_usage_delta += primary.mem_usage() as i64;
             }
+            while additional_splits.len() + 1 < chunks.len() {
+                let split =
+                    self.create_indexed_split_builder(partition, *last_delete_opstamp, ctx)?;
+                memory_usage_delta += split.mem_usage() as i64;
+                additional_splits.push(split);
+            }
+            let jobs: Vec<_> = std::iter::once(primary)
+                .chain(additional_splits.iter_mut())
+                .zip(chunks)
+                .collect();
             let _guard = ctx.protect_zone();
-            if right.is_empty() {
-                memory_usage_delta += index_documents_in_split(primary, left)?;
-            } else {
-                if secondary_split_opt.is_none() {
-                    let split =
-                        self.create_indexed_split_builder(partition, *last_delete_opstamp, ctx)?;
-                    memory_usage_delta += split.mem_usage() as i64;
-                    *secondary_split_opt = Some(split);
-                }
-                let secondary = secondary_split_opt.as_mut().unwrap();
-                (secondary.split_attrs.partition_id == partition)
-                    .then_some(())
-                    .context("E050 partition changed across batches")?;
-                let (first_result, second_result) = lanes.join(
-                    || index_documents_in_split(primary, left),
-                    || index_documents_in_split(secondary, right),
-                );
-                // join completed both writes before propagating either error. The actor fails,
-                // rather than publish a partially mutated group or retry a document in-place.
-                memory_usage_delta += first_result? + second_result?;
+            let results = lanes.run(jobs, |(split, docs)| index_documents_in_split(split, docs));
+            // All writes joined before propagating any error. Never publish a partial group
+            // or retry a document in-place after a failed writer mutation.
+            for result in results {
+                memory_usage_delta += result?;
             }
             memory_usage.increment(memory_usage_delta as f64);
             ctx.record_progress();
@@ -439,7 +440,7 @@ struct IndexingWorkbench {
 
     indexed_splits: FnvHashMap<u64, IndexedSplitBuilder>,
     other_indexed_split_opt: Option<IndexedSplitBuilder>,
-    secondary_split_opt: Option<IndexedSplitBuilder>,
+    additional_splits: Vec<IndexedSplitBuilder>,
 
     checkpoint_delta: IndexCheckpointDelta,
     publish_lock: PublishLock,
@@ -723,7 +724,7 @@ impl Indexer {
         let Some(IndexingWorkbench {
             indexed_splits,
             other_indexed_split_opt,
-            secondary_split_opt,
+            additional_splits,
             checkpoint_delta,
             publish_lock,
             batch_parent_span,
@@ -736,9 +737,7 @@ impl Indexer {
         };
 
         let mut splits: Vec<IndexedSplitBuilder> = indexed_splits.into_values().collect();
-        if let Some(secondary) = secondary_split_opt {
-            splits.push(secondary);
-        }
+        splits.extend(additional_splits);
 
         if let Some(other_split) = other_indexed_split_opt {
             splits.push(other_split)
@@ -838,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_e050_two_lane_commit_and_exact_documents() -> anyhow::Result<()> {
-        for serial in [true, false] {
+        for (lane_count, serial) in [(2, true), (2, false), (4, true), (4, false)] {
             let universe = Universe::new();
             let pipeline_id = IndexingPipelineId {
                 index_uid: IndexUid::new_with_random_ulid("e050"),
@@ -855,7 +854,7 @@ mod tests {
                 .returning(|_| Ok(LastDeleteOpstampResponse::new(11)));
             let mut settings = IndexingSettings::for_test();
             settings.resources.heap_size = ByteSize::mb(100);
-            settings.split_num_docs_target = 4;
+            settings.split_num_docs_target = 2 * lane_count;
             let indexer = create_indexer_for_test(
                 pipeline_id,
                 mapper,
@@ -866,10 +865,12 @@ mod tests {
                 mailbox,
                 None,
             )
-            .with_two_lane(Some(super::super::two_lane::TwoLane::new(serial)?));
+            .with_two_lane(Some(super::super::two_lane::TwoLane::new(
+                lane_count, serial,
+            )?));
             let (input, handle) = universe.spawn_builder().spawn(indexer);
             for batch_id in 0..2 {
-                let docs = (batch_id * 2..batch_id * 2 + 2)
+                let docs = (batch_id * lane_count..batch_id * lane_count + lane_count)
                     .map(|id| ProcessedDoc {
                         doc: doc!(body=>format!("id-{id}")),
                         partition: 0,
@@ -881,7 +882,7 @@ mod tests {
                 input
                     .send_message(ProcessedDocBatch::new(
                         docs,
-                        SourceCheckpointDelta::from_range(batch_id..batch_id + 1),
+                        SourceCheckpointDelta::from_range(batch_id as u64..batch_id as u64 + 1),
                         false,
                     ))
                     .await?;
@@ -895,7 +896,7 @@ mod tests {
                 group.checkpoint_delta_opt.as_ref().unwrap().source_delta,
                 SourceCheckpointDelta::from_range(0..2)
             );
-            assert_eq!(group.splits.len(), 2);
+            assert_eq!(group.splits.len(), lane_count);
             let mut values = Vec::new();
             for builder in group.splits {
                 assert_eq!(builder.split_attrs.partition_id, 0);
@@ -911,7 +912,9 @@ mod tests {
                 }
             }
             values.sort();
-            assert_eq!(values, ["id-0", "id-1", "id-2", "id-3"]);
+            let mut expected: Vec<_> = (0..2 * lane_count).map(|id| format!("id-{id}")).collect();
+            expected.sort();
+            assert_eq!(values, expected);
             // An error-only/empty batch must still publish its checkpoint at a force fence.
             input
                 .send_message(ProcessedDocBatch::new(
@@ -936,7 +939,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_e050_force_timeout_eof_memory_failure_and_lock() -> anyhow::Result<()> {
-        for case in ["force", "timeout", "eof", "memory", "failure", "lock"] {
+        for (lane_count, case) in [2, 4].into_iter().flat_map(|lanes| {
+            ["force", "timeout", "eof", "memory", "failure", "lock"]
+                .into_iter()
+                .map(move |case| (lanes, case))
+        }) {
             let universe = Universe::new();
             let pipeline_id = IndexingPipelineId {
                 index_uid: IndexUid::new_with_random_ulid("e050-fences"),
@@ -970,7 +977,9 @@ mod tests {
                 mailbox,
                 None,
             )
-            .with_two_lane(Some(super::super::two_lane::TwoLane::new(false)?));
+            .with_two_lane(Some(super::super::two_lane::TwoLane::new(
+                lane_count, false,
+            )?));
             let (input, handle) = universe.spawn_builder().spawn(indexer);
             let docs = (0..4)
                 .map(|i| ProcessedDoc {
@@ -1043,13 +1052,98 @@ mod tests {
                         .sum::<u64>(),
                     4
                 );
-                assert_eq!(group.splits.len(), 2);
+                assert_eq!(group.splits.len(), lane_count);
                 for split in group.splits {
                     split.finalize()?;
                 }
             }
             universe.assert_quit().await;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_e050_four_lane_ragged_batches_and_lazy_writers() -> anyhow::Result<()> {
+        let universe = Universe::new();
+        let pipeline_id = IndexingPipelineId {
+            index_uid: IndexUid::new_with_random_ulid("e050-ragged"),
+            source_id: "test-source".into(),
+            node_id: NodeId::from_str("test-node"),
+            pipeline_uid: PipelineUid::default(),
+        };
+        let mapper = Arc::new(default_doc_mapper_for_test());
+        let body = mapper.schema().get_field("body")?;
+        let (mailbox, inbox) = universe.create_test_mailbox();
+        let mut meta = MockMetastoreService::new();
+        meta.expect_publish_splits().never();
+        meta.expect_last_delete_opstamp()
+            .returning(|_| Ok(LastDeleteOpstampResponse::new(0)));
+        let mut settings = IndexingSettings::for_test();
+        settings.resources.heap_size = ByteSize::mb(100);
+        settings.split_num_docs_target = 19;
+        let indexer = create_indexer_for_test(
+            pipeline_id,
+            mapper,
+            MetastoreServiceClient::from_mock(meta),
+            TempDirectory::for_test(),
+            settings,
+            None,
+            mailbox,
+            None,
+        )
+        .with_two_lane(Some(super::super::two_lane::TwoLane::new(4, false)?));
+        let (input, handle) = universe.spawn_builder().spawn(indexer);
+        let mut id = 0;
+        for (batch, size) in [1, 2, 7, 9].into_iter().enumerate() {
+            let docs = (0..size)
+                .map(|_| {
+                    let doc = ProcessedDoc {
+                        doc: doc!(body=>format!("id-{id}")),
+                        partition: 0,
+                        fingerprint_opt: None,
+                        timestamp_opt: None,
+                        num_bytes: 4,
+                    };
+                    id += 1;
+                    doc
+                })
+                .collect();
+            input
+                .send_message(ProcessedDocBatch::new(
+                    docs,
+                    SourceCheckpointDelta::from_range(batch as u64..batch as u64 + 1),
+                    false,
+                ))
+                .await?;
+            handle.process_pending_and_observe().await;
+        }
+        let mut groups: Vec<IndexedSplitBatchBuilder> = inbox.drain_for_test_typed();
+        assert_eq!(groups.len(), 1);
+        let group = groups.pop().unwrap();
+        assert_eq!(group.commit_trigger, CommitTrigger::NumDocsLimit);
+        assert_eq!(group.splits.len(), 4);
+        assert_eq!(
+            group.checkpoint_delta_opt.unwrap().source_delta,
+            SourceCheckpointDelta::from_range(0..4)
+        );
+        let mut values = Vec::new();
+        for builder in group.splits {
+            assert!(builder.split_attrs.num_docs > 0);
+            let split = builder.finalize()?;
+            let searcher = split.index.reader()?.searcher();
+            assert_eq!(searcher.segment_readers().len(), 1);
+            for id in 0..searcher.num_docs() as u32 {
+                let doc: TantivyDocument = searcher.doc(DocAddress::new(0, id))?;
+                values.push(doc.get_first(body).unwrap().as_str().unwrap().to_owned());
+            }
+        }
+        values.sort();
+        let mut expected: Vec<_> = (0..19).map(|id| format!("id-{id}")).collect();
+        expected.sort();
+        assert_eq!(values, expected);
+        universe.send_exit_with_success(&input).await?;
+        assert!(handle.join().await.0.is_success());
+        universe.assert_quit().await;
         Ok(())
     }
 

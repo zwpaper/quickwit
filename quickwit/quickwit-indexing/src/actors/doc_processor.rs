@@ -669,8 +669,7 @@ impl Handler<RawDocBatch> for DocProcessor {
         let mut processed_docs: Vec<ProcessedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
 
         if let Some(lanes) = &self.two_lane_opt {
-            let mut left = raw_doc_batch.docs;
-            let right = left.split_off(left.len().div_ceil(2));
+            let chunks = lanes.chunks(raw_doc_batch.docs);
             let mapper = &self.doc_mapper;
             let counters = &self.counters;
             let timestamp_field = self.timestamp_field_opt;
@@ -682,9 +681,7 @@ impl Handler<RawDocBatch> for DocProcessor {
                 output
             };
             let _guard = ctx.protect_zone();
-            let (mut first, second) = lanes.join(|| process(left), || process(right));
-            first.extend(second);
-            processed_docs = first;
+            processed_docs = lanes.run(chunks, process).into_iter().flatten().collect();
             ctx.record_progress();
         } else {
             for raw_doc in raw_doc_batch.docs {
@@ -795,7 +792,6 @@ mod tests {
             r#"{"id":3,"body":"last"}"#,
         ];
         let serial_counts = DocProcessorCounters::new("test".into(), "source".into());
-        let parallel_counts = DocProcessorCounters::new("test".into(), "source".into());
         let process = |input: &[&str], counters: &DocProcessorCounters| {
             let mut out = Vec::new();
             for line in input {
@@ -810,22 +806,29 @@ mod tests {
             out
         };
         let expected = process(&input, &serial_counts);
-        let pool = super::super::two_lane::TwoLane::new(false)?;
-        let (mut left, right) = pool.join(
-            || process(&input[..2], &parallel_counts),
-            || process(&input[2..], &parallel_counts),
-        );
-        left.extend(right);
-        assert_eq!(left.len(), expected.len());
-        for (actual, expected) in left.iter().zip(&expected) {
-            assert_eq!(format!("{:?}", actual.doc), format!("{:?}", expected.doc));
-            assert_eq!(actual.partition, expected.partition);
+        for count in [2, 4] {
+            for serial in [false, true] {
+                let parallel_counts = DocProcessorCounters::new("test".into(), "source".into());
+                let pool = super::super::two_lane::TwoLane::new(count, serial)?;
+                let actual: Vec<_> = pool
+                    .run(pool.chunks(input.to_vec()), |chunk| {
+                        process(&chunk, &parallel_counts)
+                    })
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(format!("{:?}", actual.doc), format!("{:?}", expected.doc));
+                    assert_eq!(actual.partition, expected.partition);
+                }
+                assert_eq!(
+                    parallel_counts.num_processed_docs(),
+                    serial_counts.num_processed_docs()
+                );
+                assert_eq!(parallel_counts.num_invalid_docs(), 2);
+            }
         }
-        assert_eq!(
-            parallel_counts.num_processed_docs(),
-            serial_counts.num_processed_docs()
-        );
-        assert_eq!(parallel_counts.num_invalid_docs(), 2);
         Ok(())
     }
 
