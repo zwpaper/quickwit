@@ -407,8 +407,10 @@ fn index_documents_in_split(
     split: &mut IndexedSplitBuilder,
     docs: Vec<ProcessedDoc>,
 ) -> anyhow::Result<i64> {
-    let before = split.mem_usage() as i64;
+    let mut memory_delta = 0;
     for processed in docs {
+        // Preserve legacy per-document accounting work in the concurrency comparison.
+        let before = split.mem_usage() as i64;
         split.split_attrs.uncompressed_docs_size_in_bytes += processed.num_bytes as u64;
         let doc_id = split.split_attrs.num_docs as DocId;
         split.split_attrs.num_docs += 1;
@@ -422,8 +424,9 @@ fn index_documents_in_split(
             .index_writer
             .add_document(processed.doc)
             .context("failed to add document")?;
+        memory_delta += split.mem_usage() as i64 - before;
     }
-    Ok(split.mem_usage() as i64 - before)
+    Ok(memory_delta)
 }
 
 /// A workbench hosts the set of `IndexedSplit` that are being built.
