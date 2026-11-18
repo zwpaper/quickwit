@@ -15,7 +15,7 @@
 use std::ops::Range;
 use std::path::Path;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fmt, io};
 
 use async_trait::async_trait;
@@ -27,8 +27,9 @@ use quickwit_common::uri::Uri;
 use quickwit_metrics::HistogramTimer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
-use tracing::instrument;
+use tracing::{info, instrument};
 
+use super::native_upload::write_owned_payload;
 use crate::metrics::object_storage_get_slice_in_flight_guards;
 use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
@@ -190,18 +191,41 @@ impl Storage for OpendalStorage {
         crate::metrics::OBJECT_STORAGE_PUT_TOTAL.inc();
         let _timer = HistogramTimer::new(&crate::metrics::OBJECT_STORAGE_PUT_OBJECT_DURATION);
         let path = path.as_os_str().to_string_lossy();
-        let mut payload_reader = payload.byte_stream().await?.into_async_read();
-
-        let mut storage_writer = self
-            .op_write
-            .writer_with(&path)
-            .chunk(self.multipart_policy.part_num_bytes(payload.len()) as usize)
-            .await?
-            .into_futures_async_write()
-            .compat_write();
-        // Avoid `tokio::io::copy`'s pending-read flush path and keep buffering policy explicit.
-        copy_read_write_loop(&mut payload_reader, &mut storage_writer).await?;
-        storage_writer.get_mut().close().await?;
+        let native = quickwit_common::get_bool_from_env_cached!("QW_E053_NATIVE_GCS_UPLOAD", false);
+        let feed_start = Instant::now();
+        let feed_secs;
+        let close_secs;
+        if native {
+            let mut writer = self
+                .op_write
+                .writer_with(&path)
+                .chunk(self.multipart_policy.part_num_bytes(payload.len()) as usize)
+                .await?;
+            (feed_secs, close_secs) =
+                write_owned_payload(&mut writer, payload.as_ref(), feed_start).await?;
+        } else {
+            let mut payload_reader = payload.byte_stream().await?.into_async_read();
+            let mut storage_writer = self
+                .op_write
+                .writer_with(&path)
+                .chunk(self.multipart_policy.part_num_bytes(payload.len()) as usize)
+                .await?
+                .into_futures_async_write()
+                .compat_write();
+            // Preserve the existing adapter path exactly for same-binary controls.
+            copy_read_write_loop(&mut payload_reader, &mut storage_writer).await?;
+            feed_secs = feed_start.elapsed().as_secs_f64();
+            let close_start = Instant::now();
+            storage_writer.get_mut().close().await?;
+            close_secs = close_start.elapsed().as_secs_f64();
+        }
+        info!(
+            native,
+            payload_bytes = payload.len(),
+            feed_secs,
+            close_secs,
+            "e053-gcs-upload-complete"
+        );
         crate::metrics::OBJECT_STORAGE_UPLOAD_NUM_BYTES.inc_by(payload.len());
         Ok(())
     }
