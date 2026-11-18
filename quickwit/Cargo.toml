@@ -1,7 +1,7 @@
 [patch."https://github.com/quickwit-oss/tantivy/"]
-tantivy = { git = "https://github.com/zwpaper/tantivy", rev = "eb2d494b5f4e26064a3ff30b7b4d41cd68dc71f4" }
-tantivy-common = { git = "https://github.com/zwpaper/tantivy", rev = "eb2d494b5f4e26064a3ff30b7b4d41cd68dc71f4" }
-tantivy-query-grammar = { git = "https://github.com/zwpaper/tantivy", rev = "eb2d494b5f4e26064a3ff30b7b4d41cd68dc71f4" }
+tantivy = { git = "https://github.com/zwpaper/tantivy", rev = "f64315703147cf7c96c0e0fbc6e2d977226fdf2a" }
+tantivy-common = { git = "https://github.com/zwpaper/tantivy", rev = "f64315703147cf7c96c0e0fbc6e2d977226fdf2a" }
+tantivy-query-grammar = { git = "https://github.com/zwpaper/tantivy", rev = "f64315703147cf7c96c0e0fbc6e2d977226fdf2a" }
 
 [workspace]
 resolver = "2"
