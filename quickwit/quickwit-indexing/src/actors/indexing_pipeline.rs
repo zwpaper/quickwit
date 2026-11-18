@@ -393,11 +393,25 @@ impl IndexingPipeline {
             .set_kill_switch(self.kill_switch.clone())
             .spawn(packager);
 
+        // E052 is a separate opt-in so one binary supplies matched serial/parallel controls.
+        let parallel_finalization =
+            std::env::var("QW_E052_PARALLEL_FINALIZATION").is_ok_and(|value| value == "1");
+        anyhow::ensure!(
+            !parallel_finalization
+                || two_lane_opt
+                    .as_ref()
+                    .is_some_and(|lanes| lanes.count() == 2),
+            "E052 parallel finalization requires exactly two experimental ingest lanes"
+        );
+        let finalization_pool_opt = parallel_finalization
+            .then(|| two_lane_opt.clone())
+            .flatten();
         // Index Serializer
         let index_serializer = IndexSerializer::new(
             packager_mailbox,
             self.params.indexing_io_throughput_limiter_opt.clone(),
-        );
+        )
+        .with_finalization_pool(finalization_pool_opt);
         let (index_serializer_mailbox, index_serializer_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
