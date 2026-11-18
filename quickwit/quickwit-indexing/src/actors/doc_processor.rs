@@ -15,6 +15,7 @@
 use std::string::FromUtf8Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -669,19 +670,46 @@ impl Handler<RawDocBatch> for DocProcessor {
         let mut processed_docs: Vec<ProcessedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
 
         if let Some(lanes) = &self.two_lane_opt {
-            let chunks = lanes.chunks(raw_doc_batch.docs);
+            let chunks = lanes.parse_chunks(raw_doc_batch.docs, Bytes::len);
             let mapper = &self.doc_mapper;
             let counters = &self.counters;
             let timestamp_field = self.timestamp_field_opt;
             let process = |docs: Vec<Bytes>| {
+                let doc_count = docs.len();
+                let num_bytes: usize = docs.iter().map(Bytes::len).sum();
+                let started = Instant::now();
                 let mut output = Vec::with_capacity(docs.len());
                 for raw in docs {
                     Self::process_raw_doc_fast(mapper, timestamp_field, counters, raw, &mut output);
                 }
-                output
+                (
+                    doc_count,
+                    num_bytes,
+                    started.elapsed().as_secs_f64(),
+                    output,
+                )
             };
             let _guard = ctx.protect_zone();
-            processed_docs = lanes.run(chunks, process).into_iter().flatten().collect();
+            let joined = Instant::now();
+            let results = lanes.run(chunks, process);
+            let join_secs = joined.elapsed().as_secs_f64();
+            if let [(n0, b0, t0, _), (n1, b1, t1, _)] = results.as_slice() {
+                tracing::info!(
+                    byte_balanced = lanes.byte_balanced_parse_enabled(),
+                    docs0 = n0,
+                    docs1 = n1,
+                    bytes0 = b0,
+                    bytes1 = b1,
+                    job0_secs = t0,
+                    job1_secs = t1,
+                    join_secs,
+                    "e055-parse-batch"
+                );
+            }
+            processed_docs = results
+                .into_iter()
+                .flat_map(|(_, _, _, docs)| docs)
+                .collect();
             ctx.record_progress();
         } else {
             for raw_doc in raw_doc_batch.docs {
@@ -789,7 +817,7 @@ mod tests {
             r#"{"id":0,"body":"first"}"#,
             "{invalid",
             r#"{"id":"bad"}"#,
-            r#"{"id":3,"body":"last"}"#,
+            r#"{"id":3,"body":"last with a longer payload so the weighted cut differs from the count cut while ordered parsing remains exactly equivalent"}"#,
         ];
         let serial_counts = DocProcessorCounters::new("test".into(), "source".into());
         let process = |input: &[&str], counters: &DocProcessorCounters| {
@@ -806,12 +834,14 @@ mod tests {
             out
         };
         let expected = process(&input, &serial_counts);
-        for count in [2, 4] {
+        for (count, balanced) in [(2, false), (2, true), (4, false)] {
             for serial in [false, true] {
                 let parallel_counts = DocProcessorCounters::new("test".into(), "source".into());
-                let pool = super::super::two_lane::TwoLane::new(count, serial)?;
+                let pool = super::super::two_lane::TwoLane::new_with_parse_balance(
+                    count, serial, balanced,
+                )?;
                 let actual: Vec<_> = pool
-                    .run(pool.chunks(input.to_vec()), |chunk| {
+                    .run(pool.parse_chunks(input.to_vec(), |s| s.len()), |chunk| {
                         process(&chunk, &parallel_counts)
                     })
                     .into_iter()
