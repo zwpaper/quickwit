@@ -16,6 +16,7 @@ mod base;
 use base::OpendalStorage;
 
 mod google_cloud_storage;
+mod native_upload;
 
 pub use google_cloud_storage::GoogleCloudStorageFactory;
 #[cfg(feature = "integration-testsuite")]
