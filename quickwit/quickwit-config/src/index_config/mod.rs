@@ -105,7 +105,7 @@ pub struct IndexingSettings {
     #[schema(default = 60)]
     #[serde(default = "IndexingSettings::default_commit_timeout_secs")]
     pub commit_timeout_secs: usize,
-    #[schema(default = 8)]
+    #[schema(default = 3)]
     #[serde(default = "IndexingSettings::default_docstore_compression_level")]
     pub docstore_compression_level: i32,
     #[schema(default = 1_000_000)]
@@ -138,7 +138,7 @@ impl IndexingSettings {
     }
 
     pub fn default_docstore_compression_level() -> i32 {
-        8
+        3
     }
 
     pub fn default_split_num_docs_target() -> usize {
@@ -820,6 +820,16 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn test_default_docstore_compression_level() {
+        // The engine default is level 3 (zstd dfast): cheaper than level 8
+        // (lazy2) on the docstore compression path, at some index-size cost.
+        assert_eq!(
+            IndexingSettings::default().docstore_compression_level,
+            3
+        );
     }
 
     #[test]
