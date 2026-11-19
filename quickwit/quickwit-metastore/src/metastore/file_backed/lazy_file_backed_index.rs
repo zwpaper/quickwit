@@ -62,6 +62,12 @@ impl LazyFileBackedIndex {
         }
     }
 
+    /// Returns the loaded index mutex if the index has already been initialized, without loading
+    /// it from storage.
+    pub fn get_loaded(&self) -> Option<Arc<Mutex<FileBackedIndex>>> {
+        self.lazy_index.get().cloned()
+    }
+
     /// Gets a synchronized `FileBackedIndex`. If the index wasn't provided on creation, we load it
     /// lazily on the first call of this method.
     pub async fn get(&self) -> MetastoreResult<Arc<Mutex<FileBackedIndex>>> {
