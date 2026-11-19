@@ -505,14 +505,11 @@ impl DocMapper {
         let mut document = Document::default();
 
         if let Some(source_field) = self.source_field {
-            document.add_object(
-                source_field,
-                json_obj
-                    .clone()
-                    .into_iter()
-                    .map(|(key, val)| (key, TantivyValue::from(val)))
-                    .collect(),
-            );
+            // `&serde_json::Value` implements `Value`, so it can be serialized straight into the
+            // document instead of materializing an intermediate `OwnedValue` object. Keys stay in
+            // `serde_json::Map` order (a `BTreeMap`), which is the order the `OwnedValue` path
+            // produced as well.
+            document.add_field_value(source_field, &serde_json::Value::Object(json_obj.clone()));
         }
 
         let mode = self.mode.mode_type();
@@ -538,12 +535,9 @@ impl DocMapper {
                     }
                 }
             }
-            document.add_object(
+            document.add_field_value(
                 dynamic_field,
-                dynamic_json_obj
-                    .into_iter()
-                    .map(|(key, val)| (key, TantivyValue::from(val)))
-                    .collect(),
+                &serde_json::Value::Object(dynamic_json_obj),
             );
         }
 
@@ -717,11 +711,12 @@ mod tests {
     use quickwit_common::PathHasher;
     use quickwit_query::query_ast::query_ast_from_user_text;
     use serde_json::{self, Value as JsonValue, json};
+    use tantivy::Document as _;
     use tantivy::schema::{
         FieldType, IndexRecordOption, OwnedValue as TantivyValue, OwnedValue, Type, Value,
     };
 
-    use super::DocMapper;
+    use super::{DocMapper, Document};
     use crate::doc_mapper::field_mapping_entry::{DEFAULT_TOKENIZER_NAME, RAW_TOKENIZER_NAME};
     use crate::{
         DOCUMENT_SIZE_FIELD_NAME, DYNAMIC_FIELD_NAME, DocMapperBuilder, DocParsingError,
@@ -2550,5 +2545,128 @@ mod tests {
         let new_mapper = builder.try_build().unwrap();
 
         assert_eq!(new_mapper.doc_to_json(named_doc.0).unwrap(), doc);
+    }
+
+    /// Serializing the dynamic object straight from its `serde_json` representation must produce
+    /// the same stored bytes (and the same `doc_to_json` read-back) as the removed
+    /// `BTreeMap<String, OwnedValue>` intermediate, for the `_dynamic` field and for `_source`.
+    #[test]
+    fn test_dynamic_object_direct_serialization_matches_owned_value_path() {
+        let doc_mapper: DocMapper = serde_json::from_str(
+            r#"{
+                "mode": "dynamic",
+                "dynamic_mapping": {
+                    "indexed": false,
+                    "stored": true,
+                    "fast": false,
+                    "expand_dots": true
+                },
+                "store_source": true,
+                "field_mappings": [
+                    {
+                        "name": "Timestamp",
+                        "type": "datetime",
+                        "input_formats": ["unix_timestamp", "rfc3339"],
+                        "fast_precision": "milliseconds",
+                        "fast": true,
+                        "indexed": false
+                    },
+                    {
+                        "name": "Body",
+                        "type": "text",
+                        "tokenizer": "default",
+                        "record": "position"
+                    },
+                    {"name": "ServiceName", "type": "text", "tokenizer": "raw", "fast": true},
+                    {"name": "SeverityNumber", "type": "i64", "fast": true}
+                ],
+                "timestamp_field": "Timestamp"
+            }"#,
+        )
+        .unwrap();
+        let json_doc: JsonValue = serde_json::from_str(
+            r#"{
+                "Timestamp": "2025-09-23T00:00:00.000007636Z",
+                "SeverityNumber": 9,
+                "ServiceName": "shipping",
+                "Body": "23:59:59 [INFO] Received quote",
+                "TraceFlags": 0,
+                "ResourceSchemaUrl": "",
+                "ResourceAttributes": {
+                    "app": "app",
+                    "k8s.pod.name": "shipping-bb55d5b4d-wbv9z",
+                    "k8s.pod.start_time": "2025-09-16T22:00:53Z"
+                },
+                "ScopeAttributes": {},
+                "LogAttributes": {"logtag": "F", "log.iostream": "stdout"}
+            }"#,
+        )
+        .unwrap();
+        let json_obj = json_doc.as_object().unwrap().clone();
+        let (_, document) = doc_mapper.doc_from_json_obj(json_obj.clone(), 0).unwrap();
+
+        // Legacy path: the same mapping walk followed by the removed `add_object` conversions.
+        let source_field = doc_mapper.source_field.unwrap();
+        let dynamic_field = doc_mapper.dynamic_field.unwrap();
+        let mut legacy_document = Document::default();
+        let mut legacy_dynamic_json_obj = serde_json::Map::default();
+        let mut field_path = Vec::new();
+        legacy_document.add_object(
+            source_field,
+            json_obj
+                .clone()
+                .into_iter()
+                .map(|(key, val)| (key, OwnedValue::from(val)))
+                .collect(),
+        );
+        doc_mapper
+            .field_mappings
+            .doc_from_json(
+                json_obj,
+                doc_mapper.mode.mode_type(),
+                &mut legacy_document,
+                &mut field_path,
+                &mut legacy_dynamic_json_obj,
+            )
+            .unwrap();
+        legacy_document.add_object(
+            dynamic_field,
+            legacy_dynamic_json_obj
+                .into_iter()
+                .map(|(key, val)| (key, OwnedValue::from(val)))
+                .collect(),
+        );
+
+        let schema = doc_mapper.schema();
+        // `CompactDocValue::eq` deserializes the value from the stored bytes.
+        assert_eq!(
+            document.get_first(dynamic_field),
+            legacy_document.get_first(dynamic_field)
+        );
+        assert_eq!(
+            document.get_first(source_field),
+            legacy_document.get_first(source_field)
+        );
+        let named_document = document.to_named_doc(&schema);
+        assert_eq!(
+            named_document.0,
+            legacy_document.to_named_doc(&schema).0
+        );
+
+        let document_json = doc_mapper.doc_to_json(named_document.0).unwrap();
+        let legacy_document_json = doc_mapper
+            .doc_to_json(legacy_document.to_named_doc(&schema).0)
+            .unwrap();
+        assert_eq!(document_json, legacy_document_json);
+        // the nested attribute objects survive the round-trip
+        assert_eq!(
+            document_json["ResourceAttributes"]["k8s.pod.name"],
+            "shipping-bb55d5b4d-wbv9z"
+        );
+        assert_eq!(document_json["LogAttributes"]["logtag"], "F");
+        assert_eq!(
+            document_json[SOURCE_FIELD_NAME]["ResourceAttributes"],
+            json_doc["ResourceAttributes"]
+        );
     }
 }
