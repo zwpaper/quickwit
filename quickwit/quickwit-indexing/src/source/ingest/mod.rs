@@ -50,6 +50,7 @@ use super::{
     SourceRuntime, TypedSourceFactory,
 };
 use crate::actors::DocProcessor;
+use crate::metrics::IDLE_FORCE_COMMIT_TOTAL;
 use crate::models::{LocalShardPositionsUpdate, NewPublishLock, PublishLock, SharedPublishToken};
 
 pub struct IngestSourceFactory;
@@ -129,6 +130,15 @@ struct AssignedShard {
     status: IndexingStatus,
 }
 
+/// Number of consecutive completed fetch rounds that fetched no payload after which the source
+/// force-commits the open workbench.
+///
+/// Each round is bounded by `EMIT_BATCHES_TIMEOUT` (1 s), so this is a grace measured in
+/// *completed* rounds rather than wall-clock time. A source that is merely backpressured on a full
+/// `doc_processor_mailbox` blocks inside a round and therefore cannot accumulate empty rounds: the
+/// flush only fires once the input has genuinely stopped producing.
+const IDLE_FORCE_COMMIT_EMPTY_ROUNDS: u32 = 3;
+
 /// Streams documents from a set of shards.
 pub struct IngestSource {
     client_id: ClientId,
@@ -139,6 +149,11 @@ pub struct IngestSource {
     publish_lock: PublishLock,
     publish_token: SharedPublishToken,
     event_broker: EventBroker,
+    /// Consecutive completed fetch rounds that fetched no payload. Reset to zero on any payload.
+    empty_fetch_rounds: u32,
+    /// Whether the idle force-commit was already emitted for the current idle episode (that is,
+    /// since the last fetched payload), so it is emitted at most once per idle episode.
+    idle_force_commit_sent: bool,
 }
 
 impl fmt::Debug for IngestSource {
@@ -181,6 +196,8 @@ impl IngestSource {
             publish_lock,
             publish_token,
             event_broker: source_runtime.event_broker.clone(),
+            empty_fetch_rounds: 0,
+            idle_force_commit_sent: false,
         })
     }
 
@@ -454,10 +471,12 @@ impl Source for IngestSource {
 
         let now = time::Instant::now();
         let deadline = now + *EMIT_BATCHES_TIMEOUT;
+        let mut saw_payload = false;
         loop {
             match time::timeout_at(deadline, self.fetch_stream.next()).await {
                 Ok(Ok(fetch_message)) => match fetch_message.message {
                     Some(fetch_message::Message::Payload(fetch_payload)) => {
+                        saw_payload = true;
                         self.process_fetch_payload(&mut batch_builder, fetch_payload)?;
 
                         if batch_builder.num_bytes >= BATCH_NUM_BYTES_LIMIT {
@@ -491,6 +510,30 @@ impl Source for IngestSource {
             );
             let message = batch_builder.build();
             ctx.send_message(doc_processor_mailbox, message).await?;
+        }
+        if saw_payload {
+            // The input is still producing: this round is not part of an idle episode.
+            self.empty_fetch_rounds = 0;
+            self.idle_force_commit_sent = false;
+        } else {
+            self.empty_fetch_rounds = self.empty_fetch_rounds.saturating_add(1);
+            if self.empty_fetch_rounds >= IDLE_FORCE_COMMIT_EMPTY_ROUNDS
+                && !self.idle_force_commit_sent
+            {
+                // The input has stopped producing for several completed rounds: flush the open
+                // workbench now instead of waiting out the remaining `commit_timeout`. The zero-doc
+                // batch carries an empty checkpoint delta and only sets `force_commit`.
+                self.idle_force_commit_sent = true;
+                IDLE_FORCE_COMMIT_TOTAL.inc();
+                debug!(
+                    num_empty_rounds=%self.empty_fetch_rounds,
+                    "Input idle: force-committing the open workbench."
+                );
+                let mut drain_batch = BatchBuilder::new(SourceType::IngestV2);
+                drain_batch.force_commit();
+                let message = drain_batch.build();
+                ctx.send_message(doc_processor_mailbox, message).await?;
+            }
         }
         Ok(Duration::default())
     }
@@ -694,6 +737,174 @@ mod tests {
     use crate::actors::DocProcessor;
     use crate::models::RawDocBatch;
     use crate::source::SourceActor;
+
+    /// Builds an `IngestSource` with no assigned shards for the idle-flush tests.
+    async fn for_test_ingest_source() -> IngestSource {
+        let pipeline_id = IndexingPipelineId {
+            node_id: NodeId::from_str("test-node"),
+            index_uid: IndexUid::for_test("test-index", 0),
+            source_id: "test-source".to_string(),
+            pipeline_uid: PipelineUid::default(),
+        };
+        let source_runtime = SourceRuntime {
+            pipeline_id,
+            source_config: SourceConfig::for_test("test-source", SourceParams::Ingest),
+            metastore: MetastoreServiceClient::from_mock(MockMetastoreService::new()),
+            ingester_pool: IngesterPool::default(),
+            queues_dir_path: PathBuf::from("./queues"),
+            storage_resolver: StorageResolver::for_test(),
+            event_broker: EventBroker::default(),
+            indexing_setting: IndexingSettings::default(),
+            publish_token: SharedPublishToken::default(),
+        };
+        IngestSource::try_new(source_runtime, RetryParams::for_test())
+            .await
+            .unwrap()
+    }
+
+    fn for_test_assigned_shard() -> AssignedShard {
+        AssignedShard {
+            ingester_id: NodeId::from_str("test-ingester"),
+            partition_id: 1u64.into(),
+            current_position_inclusive: Position::offset(10u64),
+            status: IndexingStatus::Active,
+        }
+    }
+
+    // A source that stops yielding payloads must force-commit the open workbench exactly once,
+    // after `IDLE_FORCE_COMMIT_EMPTY_ROUNDS` completed empty fetch rounds, with a zero-doc batch
+    // carrying an empty checkpoint delta.
+    #[tokio::test]
+    async fn test_ingest_source_force_commits_open_workbench_after_idle_rounds() {
+        let mut source = for_test_ingest_source().await;
+        source
+            .assigned_shards
+            .insert(ShardId::from(1), for_test_assigned_shard());
+
+        let universe = Universe::with_accelerated_time();
+        let (source_mailbox, _source_inbox) = universe.create_test_mailbox::<SourceActor>();
+        let (doc_processor_mailbox, doc_processor_inbox) =
+            universe.create_test_mailbox::<DocProcessor>();
+        let (observable_state_tx, _observable_state_rx) = watch::channel(serde_json::Value::Null);
+        let ctx: SourceContext =
+            ActorContext::for_test(&universe, source_mailbox, observable_state_tx);
+
+        let fetch_message_tx = source.fetch_stream.fetch_message_tx();
+        let fetch_payload = FetchPayload {
+            index_uid: Some(IndexUid::for_test("test-index", 0)),
+            source_id: "test-source".into(),
+            shard_id: Some(ShardId::from(1)),
+            mrecord_batch: MRecordBatch::for_test(["\0\0test-doc-foo"]),
+            from_position_exclusive: Some(Position::offset(10u64)),
+            to_position_inclusive: Some(Position::offset(11u64)),
+        };
+        let batch_size = fetch_payload.estimate_size();
+        fetch_message_tx
+            .send(Ok(InFlightValue::new(
+                FetchMessage::new_payload(fetch_payload),
+                batch_size,
+                &IN_FLIGHT_FETCH_STREAM,
+            )))
+            .await
+            .unwrap();
+
+        // Payload round: the docs are forwarded, nothing is force-committed.
+        source
+            .emit_batches(&doc_processor_mailbox, &ctx)
+            .await
+            .unwrap();
+        let doc_batch = doc_processor_inbox
+            .recv_typed_message::<RawDocBatch>()
+            .await
+            .unwrap();
+        assert_eq!(doc_batch.docs.len(), 1);
+        assert!(!doc_batch.force_commit);
+        assert!(doc_processor_inbox.drain_for_test().is_empty());
+
+        // The input stops. The source must not flush before the grace has elapsed...
+        for _ in 0..(IDLE_FORCE_COMMIT_EMPTY_ROUNDS - 1) {
+            source
+                .emit_batches(&doc_processor_mailbox, &ctx)
+                .await
+                .unwrap();
+            assert!(doc_processor_inbox.drain_for_test().is_empty());
+        }
+
+        // ... and must flush the open workbench on the grace-th empty round.
+        source
+            .emit_batches(&doc_processor_mailbox, &ctx)
+            .await
+            .unwrap();
+        let drain_batch = doc_processor_inbox
+            .recv_typed_message::<RawDocBatch>()
+            .await
+            .unwrap();
+        assert!(drain_batch.docs.is_empty());
+        assert!(drain_batch.force_commit);
+        assert!(drain_batch.checkpoint_delta.is_empty());
+
+        // At most one flush per idle episode: further empty rounds emit nothing.
+        for _ in 0..IDLE_FORCE_COMMIT_EMPTY_ROUNDS {
+            source
+                .emit_batches(&doc_processor_mailbox, &ctx)
+                .await
+                .unwrap();
+            assert!(doc_processor_inbox.drain_for_test().is_empty());
+        }
+    }
+
+    // A source that keeps yielding payloads, even slowly, must never force-commit.
+    #[tokio::test]
+    async fn test_ingest_source_does_not_force_commit_while_payloads_keep_arriving() {
+        let mut source = for_test_ingest_source().await;
+        source
+            .assigned_shards
+            .insert(ShardId::from(1), for_test_assigned_shard());
+
+        let universe = Universe::with_accelerated_time();
+        let (source_mailbox, _source_inbox) = universe.create_test_mailbox::<SourceActor>();
+        let (doc_processor_mailbox, doc_processor_inbox) =
+            universe.create_test_mailbox::<DocProcessor>();
+        let (observable_state_tx, _observable_state_rx) = watch::channel(serde_json::Value::Null);
+        let ctx: SourceContext =
+            ActorContext::for_test(&universe, source_mailbox, observable_state_tx);
+
+        let fetch_message_tx = source.fetch_stream.fetch_message_tx();
+
+        // More rounds than the grace, one payload each: the idle flush must never fire.
+        for i in 0..(IDLE_FORCE_COMMIT_EMPTY_ROUNDS + 2) {
+            let from_position = 10 + u64::from(i);
+            let fetch_payload = FetchPayload {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".into(),
+                shard_id: Some(ShardId::from(1)),
+                mrecord_batch: MRecordBatch::for_test(["\0\0test-doc"]),
+                from_position_exclusive: Some(Position::offset(from_position)),
+                to_position_inclusive: Some(Position::offset(from_position + 1)),
+            };
+            let batch_size = fetch_payload.estimate_size();
+            fetch_message_tx
+                .send(Ok(InFlightValue::new(
+                    FetchMessage::new_payload(fetch_payload),
+                    batch_size,
+                    &IN_FLIGHT_FETCH_STREAM,
+                )))
+                .await
+                .unwrap();
+
+            source
+                .emit_batches(&doc_processor_mailbox, &ctx)
+                .await
+                .unwrap();
+            let doc_batch = doc_processor_inbox
+                .recv_typed_message::<RawDocBatch>()
+                .await
+                .unwrap();
+            assert_eq!(doc_batch.docs.len(), 1);
+            assert!(!doc_batch.force_commit);
+        }
+        assert!(doc_processor_inbox.drain_for_test().is_empty());
+    }
 
     // In this test, we simulate a source to which we sequentially assign the following set of
     // shards []
