@@ -1,8 +1,8 @@
 # Keep the final ClickBench stack reproducible without an external build-time patch.
 [patch."https://github.com/quickwit-oss/tantivy/"]
-tantivy = { git = "https://github.com/zwpaper/tantivy", rev = "eb2d494b5f4e26064a3ff30b7b4d41cd68dc71f4" }
-tantivy-common = { git = "https://github.com/zwpaper/tantivy", rev = "eb2d494b5f4e26064a3ff30b7b4d41cd68dc71f4" }
-tantivy-query-grammar = { git = "https://github.com/zwpaper/tantivy", rev = "eb2d494b5f4e26064a3ff30b7b4d41cd68dc71f4" }
+tantivy = { git = "https://github.com/zwpaper/tantivy", rev = "f16464cee1f7f818f04c8d239c203a1a55dcf3ee" }
+tantivy-common = { git = "https://github.com/zwpaper/tantivy", rev = "f16464cee1f7f818f04c8d239c203a1a55dcf3ee" }
+tantivy-query-grammar = { git = "https://github.com/zwpaper/tantivy", rev = "f16464cee1f7f818f04c8d239c203a1a55dcf3ee" }
 
 [workspace]
 resolver = "2"
