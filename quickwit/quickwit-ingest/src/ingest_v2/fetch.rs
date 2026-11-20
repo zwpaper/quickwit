@@ -159,15 +159,16 @@ impl FetchStreamTask {
                     locations.push(location);
                 }
             }
-            // Drop the lock while we decompress and send the message.
+            // Drop the lock before decompressing and sending the message. The hold metric
+            // is reported right after the guard drops so it covers only the critical
+            // section (locating the records), not the now-off-lock decompression.
             drop(mrecordlog_guard);
+            warn_on_long_lock_hold("fetch_stream", "partial", acquired_at);
 
             for Record { payload, .. } in locations.into_records() {
                 mrecord_buffer.put(payload.borrow());
                 mrecord_lengths.push(payload.len() as u32);
             }
-
-            warn_on_long_lock_hold("fetch_stream", "partial", acquired_at);
 
             if !mrecord_lengths.is_empty() {
                 let from_position_exclusive = if self.from_position_inclusive == 0 {
