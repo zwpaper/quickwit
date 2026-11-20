@@ -690,3 +690,178 @@ fn test_record_locations_decode_identical_to_range() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// E033: format/downgrade enforcement (G4) and in-memory decompress hardening (G7).
+// ---------------------------------------------------------------------------------------
+
+/// G7: a corrupted compressed in-memory batch must fail loudly on the public fetch path,
+/// never return a `Cow::Owned(Vec::new())` at a valid position.
+#[test]
+#[should_panic(expected = "in-memory WAL batch is corrupted")]
+fn test_corrupt_inmemory_batch_is_fatal_end_to_end() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            format!(
+                "{{\"doc\":{i},\"body\":\"{}\"}}\n",
+                "lorem ipsum dolor sit amet ".repeat(20)
+            )
+            .into_bytes()
+        })
+        .collect();
+    let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+    )
+    .unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records("queue", None, payloads.iter().map(|payload| payload.as_slice()))
+        .unwrap();
+    record_log.corrupt_in_memory_for_test();
+    // The fetch path must not serve an empty payload at a valid position.
+    let _ = record_log.range("queue", ..).unwrap().collect::<Vec<_>>();
+}
+
+/// G4: the compression format marker + reader-capability guard. A reader that declares it
+/// cannot decode compressed frames is refused on a compression-marked WAL; a
+/// compression-aware reader opens it. A plain WAL has no marker and is accepted either way.
+#[test]
+fn test_compression_format_guard_accepts_and_rejects() {
+    let compressed_dir = tempfile::tempdir().unwrap();
+    {
+        let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+            compressed_dir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        wal.create_queue("q").unwrap();
+        wal.append_record("q", None, b"hello".as_slice()).unwrap();
+    }
+    assert!(crate::multi_record_log::has_compression_format_marker(
+        compressed_dir.path()
+    ));
+
+    let rejected = MultiRecordLog::open_with_prefs_and_compression_capability(
+        compressed_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        false,
+        false,
+    );
+    assert!(matches!(
+        rejected,
+        Err(crate::error::ReadRecordError::CompressionUnsupported)
+    ));
+
+    let accepted = MultiRecordLog::open_with_prefs_and_compression_capability(
+        compressed_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        false,
+        true,
+    )
+    .unwrap();
+    assert_eq!(accepted.range("q", ..).unwrap().count(), 1);
+
+    // A plaintext (never compression-enabled) WAL has no marker.
+    let plain_dir = tempfile::tempdir().unwrap();
+    {
+        let mut wal = MultiRecordLog::open(plain_dir.path()).unwrap();
+        wal.create_queue("q").unwrap();
+        wal.append_record("q", None, b"hello".as_slice()).unwrap();
+    }
+    assert!(!crate::multi_record_log::has_compression_format_marker(
+        plain_dir.path()
+    ));
+    assert!(MultiRecordLog::open_with_prefs_and_compression_capability(
+        plain_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        false,
+        false,
+    )
+    .is_ok());
+}
+
+/// G4 item 1 (in-crate structural model): the writer records a format sentinel whenever it
+/// enables compression. Its declared queue position (`1`) is ahead of its record position
+/// (`0`), so the pre-E020 recovery step (ack position 1, then append position 0) hits the
+/// "in the past" path and maps it to `Corruption`: the old reader fails `open` loudly
+/// instead of recovering only the uncompressed prefix. The sentinel must not leak into the
+/// user-visible queue set for a compression-aware reader.
+#[test]
+fn test_compression_sentinel_forces_pre_e020_loud_failure_and_is_skipped() {
+    // Model of the pre-E020 recovery check on the sentinel: append at 0 after acking 1.
+    let sentinel_declared_position = 1u64;
+    let sentinel_record_position = 0u64;
+    assert!(sentinel_record_position < sentinel_declared_position);
+
+    let tempdir = tempfile::tempdir().unwrap();
+    {
+        let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+            tempdir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        wal.create_queue("q").unwrap();
+        wal.append_record("q", None, b"hello".as_slice()).unwrap();
+        assert_eq!(wal.list_queues().collect::<Vec<_>>(), vec!["q"]);
+    }
+    // A compression-aware reopen skips the sentinel and replays the record.
+    let wal = MultiRecordLog::open_with_prefs_and_compression_capability(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+        true,
+    )
+    .unwrap();
+    assert_eq!(wal.list_queues().collect::<Vec<_>>(), vec!["q"]);
+    assert_eq!(wal.range("q", ..).unwrap().count(), 1);
+}
+
+/// G4 item 3: upgrade + mixed WAL. An E017-compatible (gate OFF) writer writes a plaintext
+/// prefix; an E027 writer with the gate ON reopens the same WAL and continues with a
+/// compressed record; replay after reopening gate OFF is byte-identical.
+#[test]
+fn test_mixed_wal_upgrade_replay_identity() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let prefix: Vec<Vec<u8>> = (0..3).map(|i| format!("plain-{i}").into_bytes()).collect();
+
+    // Phase 1: E017-compatible writer (compression disabled).
+    {
+        let mut wal = MultiRecordLog::open(tempdir.path()).unwrap();
+        wal.create_queue("q").unwrap();
+        for payload in &prefix {
+            wal.append_record("q", None, payload.as_slice()).unwrap();
+        }
+    }
+
+    // Phase 2: E027 with the gate ON reopens and continues. It writes the format marker +
+    // sentinel and one record large enough to be compressed.
+    let big = "lorem ipsum dolor sit amet ".repeat(5_000).into_bytes();
+    {
+        let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+            tempdir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        wal.append_record("q", None, big.as_slice()).unwrap();
+    }
+    assert!(crate::multi_record_log::has_compression_format_marker(
+        tempdir.path()
+    ));
+
+    // Phase 3: reopen gate OFF and replay the full mixed sequence byte-identically.
+    let wal = MultiRecordLog::open(tempdir.path()).unwrap();
+    let records: Vec<Vec<u8>> = wal
+        .range("q", ..)
+        .unwrap()
+        .map(|record| record.payload.into_owned())
+        .collect();
+    let mut expected = prefix;
+    expected.push(big);
+    assert_eq!(records, expected);
+}

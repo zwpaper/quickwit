@@ -177,6 +177,59 @@ fn test_mem_queues_non_zero_first_el() {
 }
 
 #[test]
+fn test_corrupt_compressed_inmemory_batch_is_fatal_not_empty() {
+    // G7 regression: a corrupted compressed in-memory batch must fail loudly. It must
+    // never decode to an empty payload at a valid position (the ack-and-truncate path).
+    let plain: Vec<u8> = b"a repeated in-memory log line body ".repeat(400);
+    let compressed = zstd::bulk::compress(&plain, 1).unwrap();
+    let mut blob = Vec::with_capacity(4 + compressed.len());
+    blob.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&compressed);
+
+    let mut queue = MemQueue::default();
+    queue
+        .append_batch(
+            &FileNumber::for_test(1),
+            blob,
+            true,
+            std::iter::once((0u64, 0usize, plain.len())),
+        )
+        .unwrap();
+    // Sanity: the batch decodes before corruption.
+    assert_eq!(queue.range(..).next().unwrap().payload.as_ref(), &plain[..]);
+
+    queue.inject_compressed_batch_corruption();
+
+    let range_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = queue.range(..).collect::<Vec<_>>();
+    }));
+    assert!(
+        range_panicked.is_err(),
+        "corrupt in-memory batch must be fatal in range(), not a valid-position empty payload"
+    );
+
+    let last_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = queue.last_record();
+    }));
+    assert!(
+        last_panicked.is_err(),
+        "corrupt in-memory batch must be fatal in last_record()"
+    );
+
+    let mut locations = RecordLocations::new();
+    for location in queue.record_locations(..) {
+        locations.push(location);
+    }
+    let fetch_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = locations.into_records().collect::<Vec<_>>();
+    }));
+    assert!(
+        fetch_panicked.is_err(),
+        "corrupt in-memory batch must be fatal on the off-lock fetch path"
+    );
+}
+
+#[test]
 fn test_mem_queues_keep_filenum() {
     let mut mem_queues = MemQueues::default();
 

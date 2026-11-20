@@ -5,13 +5,17 @@ use std::sync::Arc;
 
 use crate::error::AppendError;
 use crate::mem::QueueSummary;
-use crate::record::{MULTIPLEXED_RECORD_HEADER_LEN, MULTIRECORD_ENTRY_HEADER_LEN};
 use crate::rolling::FileNumber;
 use crate::Record;
 
 /// Number of bytes at the start of a compressed batch holding the decrypted length
 /// as a little-endian `u32` (the same prefix the record writer uses on disk).
 const UNCOMPRESSED_LEN_NUM_BYTES: usize = 4;
+
+/// Upper bound on the decompressed size accepted from the in-memory `u32` length
+/// prefix. A corrupt prefix would otherwise let us reserve several GiB before zstd
+/// rejects the payload. Mirrors the on-disk reader's cap.
+const MAX_IN_MEMORY_DECOMPRESSED_BYTES: usize = 1 << 30;
 
 #[derive(Clone)]
 struct RecordMeta {
@@ -123,11 +127,16 @@ impl RecordLocations {
                 current_batch = Some(location.batch.clone());
             }
             let end = location.offset + location.len;
-            let payload = if end <= plain_buffer.len() {
-                Cow::Owned(plain_buffer[location.offset..end].to_vec())
-            } else {
-                Cow::Owned(Vec::new())
-            };
+            assert!(
+                end <= plain_buffer.len(),
+                "in-memory WAL batch is corrupted: record at position {} has \
+                 [{}..{}] outside the {}-byte decoded batch",
+                location.position,
+                location.offset,
+                end,
+                plain_buffer.len()
+            );
+            let payload = Cow::Owned(plain_buffer[location.offset..end].to_vec());
             Record {
                 position: location.position,
                 payload,
@@ -139,10 +148,11 @@ impl RecordLocations {
 impl Batch {
     /// Copies the batch's plaintext into `out` (reusing `out`'s allocation).
     ///
-    /// A decompression failure leaves `out` empty; the payload accessors then yield
-    /// an empty payload rather than panicking. In-memory corruption is not expected
-    /// (the bytes are produced and owned by this process) and the on-disk record
-    /// remains authoritative until truncation.
+    /// A corrupted in-memory batch is **fatal**: the bytes are produced and owned by
+    /// this process, so a decode failure means RAM corruption. Returning an empty
+    /// payload here would let the fetch path treat a valid position as an empty record
+    /// and later truncate the authoritative on-disk record on ack (a data-loss path).
+    /// We therefore panic instead of ever serving an empty payload at a valid position.
     fn write_plain_into(
         &self,
         mut decompressor: Option<&mut zstd::bulk::Decompressor<'static>>,
@@ -151,21 +161,30 @@ impl Batch {
         out.clear();
         if self.is_compressed {
             let Some(decompressor) = decompressor.as_mut() else {
-                return;
+                panic!("in-memory WAL batch is corrupted: no zstd decompressor available");
             };
-            if self.bytes.len() < UNCOMPRESSED_LEN_NUM_BYTES {
-                return;
-            }
+            assert!(
+                self.bytes.len() >= UNCOMPRESSED_LEN_NUM_BYTES,
+                "in-memory WAL batch is corrupted: compressed blob is {} bytes",
+                self.bytes.len()
+            );
             let plain_len =
                 u32::from_le_bytes(self.bytes[..UNCOMPRESSED_LEN_NUM_BYTES].try_into().unwrap())
                     as usize;
+            assert!(
+                plain_len <= MAX_IN_MEMORY_DECOMPRESSED_BYTES,
+                "in-memory WAL batch is corrupted: declared {plain_len} plaintext bytes"
+            );
             out.resize(plain_len, 0);
-            if decompressor
+            match decompressor
                 .decompress_to_buffer(&self.bytes[UNCOMPRESSED_LEN_NUM_BYTES..], out)
-                .is_err()
             {
-                tracing::error!("failed to decompress in-memory record batch");
-                out.clear();
+                Ok(num_bytes) if num_bytes == plain_len => {}
+                Ok(num_bytes) => panic!(
+                    "in-memory WAL batch is corrupted: decoded {num_bytes} bytes, \
+                     expected {plain_len}"
+                ),
+                Err(err) => panic!("in-memory WAL batch is corrupted: {err}"),
             }
         } else {
             out.extend_from_slice(&self.bytes);
@@ -241,11 +260,16 @@ impl MemQueue {
 
     fn record_from_plain(&self, record_meta: &RecordMeta, plain: &[u8]) -> Record<'_> {
         let end = record_meta.offset + record_meta.len;
-        let payload = if end <= plain.len() {
-            Cow::Owned(plain[record_meta.offset..end].to_vec())
-        } else {
-            Cow::Owned(Vec::new())
-        };
+        assert!(
+            end <= plain.len(),
+            "in-memory WAL batch is corrupted: record at position {} has \
+             [{}..{}] outside the {}-byte decoded batch",
+            record_meta.position,
+            record_meta.offset,
+            end,
+            plain.len()
+        );
+        let payload = Cow::Owned(plain[record_meta.offset..end].to_vec());
         Record {
             position: record_meta.position,
             payload,
@@ -449,6 +473,19 @@ impl MemQueue {
     pub fn size(&self) -> usize {
         self.batches.iter().map(|batch| batch.bytes.len()).sum::<usize>()
             + self.record_metas.len() * std::mem::size_of::<RecordMeta>()
+    }
+
+    /// Test-only corruption injector for the in-memory compression regression: overwrite
+    /// every compressed batch's zstd payload with `0xff` so decoding deterministically fails.
+    #[cfg(test)]
+    pub(crate) fn inject_compressed_batch_corruption(&mut self) {
+        for batch in &mut self.batches {
+            if let Some(batch) = Arc::get_mut(batch) {
+                if batch.is_compressed && batch.bytes.len() > UNCOMPRESSED_LEN_NUM_BYTES {
+                    batch.bytes[UNCOMPRESSED_LEN_NUM_BYTES..].fill(0xff);
+                }
+            }
+        }
     }
 
     pub fn capacity(&self) -> usize {

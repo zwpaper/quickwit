@@ -202,6 +202,14 @@ impl MemQueues {
         }
     }
 
+    /// Test-only: corrupt every compressed in-memory batch so decoding fails.
+    #[cfg(test)]
+    pub(crate) fn inject_compressed_batch_corruption(&mut self) {
+        for queue in self.queues.values_mut() {
+            queue.inject_compressed_batch_corruption();
+        }
+    }
+
     /// Return a tuple of (size, capacity) of memory used by the memqueues
     pub fn size(&self) -> (usize, usize) {
         let size = self
