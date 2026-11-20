@@ -42,6 +42,12 @@ pub(crate) static IDLE_FORCE_COMMIT_TOTAL: LazyCounter = lazy_counter!(
         subsystem: "indexing",
 );
 
+pub(crate) static BACKLOG_FORCE_COMMIT_TOTAL: LazyCounter = lazy_counter!(
+        name: "backlog_force_commit_total",
+        description: "Number of force-commits emitted by a source after its un-truncated byte budget was reached.",
+        subsystem: "indexing",
+);
+
 pub(crate) static DOCS_CLUSTER_GROUP_SIZE: LazyHistogram = lazy_histogram!(
         name: "docs_cluster_group_size",
         description: "Document cluster group size when finalizing an indexed split.",
