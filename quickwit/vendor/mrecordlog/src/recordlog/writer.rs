@@ -5,9 +5,24 @@ use crate::frame::{FrameType, FrameWriter};
 use crate::rolling::{Directory, FileNumber, RollingWriter};
 use crate::{BlockWrite, PersistAction, Serializable};
 
+/// Minimum serialized record size worth compressing. Smaller records (queue
+/// bookkeeping, single small appends) keep the uncompressed framing so the codec
+/// overhead never makes a record bigger.
+const COMPRESSION_MIN_BYTES: usize = 8 * 1024;
+
+/// zstd level used for record compression. Level 1 keeps the CPU added inside the
+/// ingester write lock well below the device time it removes.
+const COMPRESSION_LEVEL: i32 = 1;
+
+/// Number of bytes prefixed to a compressed record holding its uncompressed length
+/// as a little-endian `u32`, so the reader knows how much to reserve.
+const UNCOMPRESSED_LEN_NUM_BYTES: usize = 4;
+
 pub struct RecordWriter<W> {
     frame_writer: FrameWriter<W>,
     buffer: Vec<u8>,
+    compression_buffer: Vec<u8>,
+    compressor: Option<zstd::bulk::Compressor<'static>>,
 }
 
 fn frame_type(is_first_frame: bool, is_last_frame: bool) -> FrameType {
@@ -24,6 +39,9 @@ impl<W: BlockWrite + Unpin> From<FrameWriter<W>> for RecordWriter<W> {
         RecordWriter {
             frame_writer,
             buffer: Vec::with_capacity(10_000),
+            compression_buffer: Vec::new(),
+            // If the context cannot be created, records are written uncompressed.
+            compressor: zstd::bulk::Compressor::new(COMPRESSION_LEVEL).ok(),
         }
     }
 }
@@ -51,6 +69,7 @@ impl<W: BlockWrite + Unpin> RecordWriter<W> {
 
         self.buffer.clear();
         record.serialize(&mut self.buffer);
+        let compressed = self.compress_buffer_if_worthwhile();
         let mut payload = &self.buffer[..];
 
         loop {
@@ -62,7 +81,9 @@ impl<W: BlockWrite + Unpin> RecordWriter<W> {
             payload = &payload[frame_payload_len..];
             let is_last_frame = payload.is_empty();
             let frame_type = frame_type(is_first_frame, is_last_frame);
-            num_bytes_written += self.frame_writer.write_frame(frame_type, frame_payload)? as u64;
+            num_bytes_written +=
+                self.frame_writer
+                    .write_frame(frame_type, compressed, frame_payload)? as u64;
             is_first_frame = false;
 
             if is_last_frame {
@@ -70,6 +91,36 @@ impl<W: BlockWrite + Unpin> RecordWriter<W> {
             }
         }
         Ok(num_bytes_written)
+    }
+
+    /// Replaces `self.buffer` with `[u32 uncompressed_len][zstd payload]` when the
+    /// record is large enough and compression actually shrinks it. Returns whether the
+    /// buffer now holds a compressed record.
+    fn compress_buffer_if_worthwhile(&mut self) -> bool {
+        let uncompressed_len = self.buffer.len();
+        if uncompressed_len < COMPRESSION_MIN_BYTES || uncompressed_len > u32::MAX as usize {
+            return false;
+        }
+        let Some(compressor) = self.compressor.as_mut() else {
+            return false;
+        };
+        let mut compressed = std::mem::take(&mut self.compression_buffer);
+        compressed.clear();
+        compressed.reserve(zstd::compress_bound(uncompressed_len));
+        let compress_result = compressor.compress_to_buffer(&self.buffer, &mut compressed);
+        if compress_result.is_err()
+            || compressed.len() + UNCOMPRESSED_LEN_NUM_BYTES >= uncompressed_len
+        {
+            // Compressing failed or did not help: keep the record uncompressed.
+            self.compression_buffer = compressed;
+            return false;
+        }
+        self.buffer.clear();
+        self.buffer
+            .extend_from_slice(&(uncompressed_len as u32).to_le_bytes());
+        self.buffer.extend_from_slice(&compressed);
+        self.compression_buffer = compressed;
+        true
     }
 
     /// Persist the data to disk, according to the persist_action.
