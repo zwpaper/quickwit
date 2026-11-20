@@ -9,7 +9,9 @@ use crate::error::{
     AppendError, CreateQueueError, DeleteQueueError, MissingQueue, ReadRecordError, TruncateError,
 };
 use crate::mem::{MemQueue, QueuesSummary};
-use crate::record::{MultiPlexedRecord, MultiRecord};
+use crate::record::{
+    MultiPlexedRecord, MultiRecord, MULTIPLEXED_RECORD_HEADER_LEN, MULTIRECORD_ENTRY_HEADER_LEN,
+};
 use crate::recordlog::RecordWriter;
 use crate::rolling::RollingWriter;
 use crate::{
@@ -61,19 +63,18 @@ impl MultiRecordLog {
                         if !in_mem_queues.contains_queue(queue) {
                             in_mem_queues.ack_position(queue, position);
                         }
+                        // Group the whole replayed append batch into one plaintext
+                        // in-memory batch (recovery reads decompressed records).
+                        let mut payloads = Vec::new();
                         for record in records {
                             // if this fails, it means some corruption wasn't detected at a lower
                             // level, or we wrote invalid data.
                             let (position, payload) = record?;
-                            // this can fail if queue doesn't exist (it was created just above, so
-                            // it does), or if the position is in the past. This can happen if the
-                            // queue is deleted and recreated in a block which get skipped for
-                            // corruption. In that case, maybe we should ack_position() and try
-                            // to insert again?
-                            in_mem_queues
-                                .append_record(queue, &file_number, position, payload)
-                                .map_err(|_| ReadRecordError::Corruption)?;
+                            payloads.push((position, payload));
                         }
+                        in_mem_queues
+                            .append_plain_records(queue, &file_number, payloads.into_iter())
+                            .map_err(|_| ReadRecordError::Corruption)?;
                     }
                     MultiPlexedRecord::Truncate {
                         truncate_range,
@@ -210,16 +211,27 @@ impl MultiRecordLog {
             records,
         };
         let num_bytes_written = self.record_log_writer.write_record(record)?;
+        // Copy the exact bytes the writer framed to disk. When the record was large
+        // enough they are already compressed, so the in-memory queue can reuse the
+        // blob without recompressing.
+        let (blob, is_compressed) = {
+            let (blob, is_compressed) = self.record_log_writer.last_written_blob();
+            (blob.to_vec(), is_compressed)
+        };
         self.persist_on_policy()?;
 
         let mem_queue = self.in_mem_queues.get_queue_mut(queue)?;
+        let mut offset = MULTIPLEXED_RECORD_HEADER_LEN + queue.len() + MULTIRECORD_ENTRY_HEADER_LEN;
         let mut max_position = position;
+        let mut records_meta = Vec::new();
         for record in records {
             // we just serialized it, we know it's valid
             let (position, payload) = record.unwrap();
-            mem_queue.append_record(&file_number, position, payload)?;
+            records_meta.push((position, offset, payload.len()));
+            offset += MULTIRECORD_ENTRY_HEADER_LEN + payload.len();
             max_position = position;
         }
+        mem_queue.append_batch(&file_number, blob, is_compressed, records_meta.into_iter())?;
 
         self.multi_record_spare_buffer = multi_record_spare_buffer;
         Ok(AppendOutcome {
