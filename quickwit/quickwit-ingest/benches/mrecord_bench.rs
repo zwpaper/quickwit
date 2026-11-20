@@ -128,8 +128,12 @@ fn make_batch() -> (Vec<Bytes>, u64) {
 /// the WAL.
 fn open_bench_wal() -> (tempfile::TempDir, MultiRecordLog) {
     let tempdir = tempfile::tempdir().expect("failed to create temp dir");
-    let mut wal = MultiRecordLog::open_with_prefs(tempdir.path(), DEFAULT_WAL_PERSIST_POLICY)
-        .expect("failed to open WAL");
+    let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        DEFAULT_WAL_PERSIST_POLICY,
+        true,
+    )
+    .expect("failed to open WAL");
     wal.create_queue(BENCH_QUEUE)
         .expect("failed to create queue");
     (tempdir, wal)

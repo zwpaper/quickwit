@@ -29,8 +29,15 @@ pub struct MultiRecordLog {
 
 impl MultiRecordLog {
     /// Open the multi record log, flushing after each operation, but not fsyncing.
+    ///
+    /// Record compression is disabled so the on-disk format matches one written before
+    /// compression existed. Use [`Self::open_with_prefs_and_compression`] to opt in.
     pub fn open(directory_path: &Path) -> Result<Self, ReadRecordError> {
-        Self::open_with_prefs(directory_path, PersistPolicy::Always(PersistAction::Flush))
+        Self::open_with_prefs_and_compression(
+            directory_path,
+            PersistPolicy::Always(PersistAction::Flush),
+            false,
+        )
     }
 
     pub fn summary(&self) -> QueuesSummary {
@@ -38,9 +45,24 @@ impl MultiRecordLog {
     }
 
     /// Open the multi record log, syncing following the provided policy.
+    ///
+    /// Record compression is disabled by default; see
+    /// [`Self::open_with_prefs_and_compression`].
     pub fn open_with_prefs(
         directory_path: &Path,
         persist_policy: PersistPolicy,
+    ) -> Result<Self, ReadRecordError> {
+        Self::open_with_prefs_and_compression(directory_path, persist_policy, false)
+    }
+
+    /// Open the multi record log, syncing following the provided policy and choosing
+    /// whether the writer compresses newly appended records. Reading is unconditional:
+    /// a log containing compressed frames opens regardless of `compression_enabled`, so
+    /// enabling it is not a per-node requirement and disabling it does not hide data.
+    pub fn open_with_prefs_and_compression(
+        directory_path: &Path,
+        persist_policy: PersistPolicy,
+        compression_enabled: bool,
     ) -> Result<Self, ReadRecordError> {
         // io errors are non-recoverable
         let rolling_reader = crate::rolling::RollingReader::open(directory_path)?;
@@ -96,7 +118,8 @@ impl MultiRecordLog {
             }
         }
         // io errors are non-recoverable
-        let record_log_writer: RecordWriter<RollingWriter> = record_reader.into_writer()?;
+        let mut record_log_writer: RecordWriter<RollingWriter> = record_reader.into_writer()?;
+        record_log_writer.set_compression_enabled(compression_enabled);
         let mut multi_record_log = MultiRecordLog {
             record_log_writer,
             in_mem_queues,

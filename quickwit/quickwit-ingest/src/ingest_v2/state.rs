@@ -180,6 +180,7 @@ impl IngesterState {
         disk_capacity: ByteSize,
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
+        wal_compression_enabled: bool,
     ) -> Self {
         let state = Self::create(cluster, disk_capacity, memory_capacity).await;
         let state_clone = state.clone();
@@ -192,6 +193,7 @@ impl IngesterState {
                     disk_capacity,
                     memory_capacity,
                     rate_limiter_settings,
+                    wal_compression_enabled,
                 )
                 .await;
         };
@@ -217,6 +219,7 @@ impl IngesterState {
             disk_capacity,
             ByteSize::mb(256),
             RateLimiterSettings::default(),
+            false,
         )
         .await;
 
@@ -233,6 +236,7 @@ impl IngesterState {
         disk_capacity: ByteSize,
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
+        wal_compression_enabled: bool,
     ) {
         // Acquire locks in the same order as `lock_fully` (mrecordlog first, then inner) to
         // prevent ABBA deadlocks with the broadcast capacity task.
@@ -242,8 +246,12 @@ impl IngesterState {
         let now = Instant::now();
 
         info!("opening WAL located at `{}`", wal_dir_path.display());
-        let open_result =
-            MultiRecordLogAsync::open_with_prefs(wal_dir_path, DEFAULT_WAL_PERSIST_POLICY).await;
+        let open_result = MultiRecordLogAsync::open_with_prefs_and_compression(
+            wal_dir_path,
+            DEFAULT_WAL_PERSIST_POLICY,
+            wal_compression_enabled,
+        )
+        .await;
 
         let mrecordlog = match open_result {
             Ok(mrecordlog) => {
@@ -818,6 +826,7 @@ mod tests {
                 ByteSize::mb(256),
                 ByteSize::mb(256),
                 RateLimiterSettings::default(),
+                false,
             )
             .await;
         timeout(Duration::from_millis(100), state.wait_for_ready())
@@ -1019,6 +1028,7 @@ mod tests {
                 ByteSize::mb(256),
                 ByteSize::mb(256),
                 RateLimiterSettings::default(),
+                false,
             )
             .await;
 

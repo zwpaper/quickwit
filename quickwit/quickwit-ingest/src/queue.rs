@@ -20,7 +20,7 @@ use mrecordlog::error::CreateQueueError;
 use mrecordlog::{Record, ResourceUsage};
 use quickwit_actors::ActorContext;
 
-use crate::mrecordlog_async::MultiRecordLogAsync;
+use crate::mrecordlog_async::{DEFAULT_WAL_PERSIST_POLICY, MultiRecordLogAsync};
 use crate::{
     DocBatchBuilder, FetchResponse, IngestApiService, IngestServiceError, ListQueuesResponse,
 };
@@ -35,7 +35,10 @@ pub struct Queues {
 }
 
 impl Queues {
-    pub async fn open(queues_dir_path: &Path) -> crate::Result<Queues> {
+    pub async fn open(
+        queues_dir_path: &Path,
+        wal_compression_enabled: bool,
+    ) -> crate::Result<Queues> {
         tokio::fs::create_dir_all(queues_dir_path)
             .await
             .map_err(|error| {
@@ -45,7 +48,16 @@ impl Queues {
                     error
                 ))
             })?;
-        let record_log = MultiRecordLogAsync::open(queues_dir_path).await?;
+        let record_log = if wal_compression_enabled {
+            MultiRecordLogAsync::open_with_prefs_and_compression(
+                queues_dir_path,
+                DEFAULT_WAL_PERSIST_POLICY,
+                true,
+            )
+            .await?
+        } else {
+            MultiRecordLogAsync::open(queues_dir_path).await?
+        };
         Ok(Queues { record_log })
     }
 
@@ -260,7 +272,7 @@ mod tests {
     impl QueuesForTest {
         async fn reload(&mut self) {
             std::mem::drop(self.queues.take());
-            self.queues = Some(Queues::open(self.temp_dir.path()).await.unwrap());
+            self.queues = Some(Queues::open(self.temp_dir.path(), false).await.unwrap());
         }
 
         #[track_caller]
@@ -478,7 +490,7 @@ mod tests {
             .collect();
 
         let tmpdir = tempfile::tempdir_in(".").unwrap();
-        let mut queues = Queues::open(tmpdir.path()).await.unwrap();
+        let mut queues = Queues::open(tmpdir.path(), false).await.unwrap();
         for queue_id in 0..NUM_QUEUES {
             queues
                 .create_queue(&queue_id.to_string(), &ctx)

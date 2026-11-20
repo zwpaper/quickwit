@@ -94,8 +94,9 @@ impl IngestApiService {
         queues_dir_path: &Path,
         memory_limit: usize,
         disk_limit: usize,
+        wal_compression_enabled: bool,
     ) -> crate::Result<Self> {
-        let queues = Queues::open(queues_dir_path).await?;
+        let queues = Queues::open(queues_dir_path, wal_compression_enabled).await?;
         let partition_id = get_or_initialize_partition_id(queues_dir_path).await?;
         let memory_capacity = MemoryCapacity::new(memory_limit);
         let notifications = Notifications::new();

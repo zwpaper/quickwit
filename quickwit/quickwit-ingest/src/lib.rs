@@ -71,6 +71,7 @@ pub async fn init_ingest_api(
         queues_dir_path,
         config.max_queue_memory_usage.as_u64() as usize,
         config.max_queue_disk_usage.as_u64() as usize,
+        config.wal_compression_enabled,
     )
     .await
     .with_context(|| {

@@ -6,6 +6,11 @@ use crate::recordlog::RecordWriter;
 use crate::rolling::{RollingReader, RollingWriter};
 use crate::{BlockRead, Serializable};
 
+/// Upper bound on the decompressed record size accepted from the on-disk `u32` length
+/// prefix. A corrupt or hostile prefix would otherwise let the reader reserve several
+/// GiB before zstd rejects the payload. Records above this bound are corruption.
+const MAX_DECOMPRESSED_RECORD_BYTES: usize = 1 << 30;
+
 pub struct RecordReader<R> {
     frame_reader: FrameReader<R>,
     record_buffer: Vec<u8>,
@@ -102,6 +107,9 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
         }
         let uncompressed_len =
             u32::from_le_bytes(self.record_buffer[..4].try_into().unwrap()) as usize;
+        if uncompressed_len > MAX_DECOMPRESSED_RECORD_BYTES {
+            return Err(ReadRecordError::Corruption);
+        }
         let Some(decompressor) = self.decompressor.as_mut() else {
             return Err(ReadRecordError::Corruption);
         };
