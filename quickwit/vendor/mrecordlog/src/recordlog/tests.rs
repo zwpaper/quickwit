@@ -1,7 +1,8 @@
 use super::{RecordReader, RecordWriter};
 use crate::block_read_write::ArrayReader;
 use crate::error::ReadRecordError;
-use crate::frame::HEADER_LEN;
+use crate::frame::{FrameWriter, HEADER_LEN};
+use crate::rolling::{RollingReader, RollingWriter};
 use crate::{MultiRecordLog, PersistAction, PersistPolicy, BLOCK_NUM_BYTES};
 
 #[test]
@@ -322,5 +323,51 @@ fn test_old_reader_rejects_compressed_frames_without_misdecoding() {
     assert!(
         num_frames > 1,
         "expected a multi-frame compressed record, found {num_frames} frames"
+    );
+}
+
+/// Compressed-path extension of `rolling::tests::test_roll_fsync_is_deferred`: with the
+/// compression gate ON, a WAL roll still schedules exactly one deferred fsync per rolled file
+/// via the `RollSyncer`, and the roll write returns before the background fsync has run.
+#[test]
+fn test_roll_fsync_is_deferred_compressed() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let rolling_writer: RollingWriter = RollingReader::open(tmp_dir.path())
+        .unwrap()
+        .into_writer()
+        .unwrap();
+    let mut writer: RecordWriter<RollingWriter> = FrameWriter::create(rolling_writer).into();
+    writer.set_compression_enabled(true);
+    // Gate the background fsync thread: any fsync observed on the write path would be inline.
+    writer.get_underlying_wrt().close_roll_fsync_gate();
+
+    // 160 KiB of highly repetitive data clears the 8 KiB threshold and compresses to a few
+    // frames, so several records fill the test roll (NUM_BLOCKS_PER_FILE blocks).
+    let record = "abcdefgh".repeat(20_000);
+    let mut compressed_seen = false;
+    let mut writes = 0usize;
+    while writer.get_underlying_wrt().list_file_numbers().len() < 2 {
+        writer.write_record(record.as_str()).unwrap();
+        compressed_seen |= writer.last_written_blob().1;
+        writes += 1;
+        assert!(writes < 100_000, "compressed writes never rolled a WAL file");
+    }
+    assert!(
+        compressed_seen,
+        "test did not exercise the compressed write path"
+    );
+
+    let num_rolls = writer.get_underlying_wrt().list_file_numbers().len() - 1;
+    assert!(num_rolls >= 1);
+    // The roll returned while the background thread was still gated: no inline fsync ran.
+    assert_eq!(writer.get_underlying_wrt().deferred_roll_fsync_count(), 0);
+
+    writer.get_underlying_wrt().open_roll_fsync_gate();
+    // `gc` drains the pending fsyncs before it deletes the rolled files.
+    writer.gc().unwrap();
+    // Exactly one deferred fsync per rolled file.
+    assert_eq!(
+        writer.get_underlying_wrt().deferred_roll_fsync_count(),
+        num_rolls
     );
 }
