@@ -872,6 +872,21 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_max_ingest_backlog_bytes_default_and_override() {
+        // E024: the budget is disabled by default and opt-in via the index config.
+        assert_eq!(
+            IndexingSettings::default().commit_max_ingest_backlog_bytes,
+            ByteSize::b(0)
+        );
+        let parsed: IndexingSettings =
+            serde_json::from_str(r#"{"commit_max_ingest_backlog_bytes": 134217728}"#).unwrap();
+        assert_eq!(
+            parsed.commit_max_ingest_backlog_bytes,
+            ByteSize::b(134_217_728)
+        );
+    }
+
+    #[test]
     fn test_index_config_with_malformed_maturation_duration() {
         let config_yaml = r#"
             version: 0.8

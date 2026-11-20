@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use bytes::Buf;
 
-use crate::{MultiRecordLog, Record};
+use crate::{MultiRecordLog, PersistAction, PersistPolicy, Record};
 
 fn read_all_records<'a>(multi_record_log: &'a MultiRecordLog, queue: &str) -> Vec<Cow<'a, [u8]>> {
     let mut records = Vec::new();
@@ -496,7 +496,42 @@ fn test_compressed_batch_survives_reopen() {
 #[test]
 fn test_inmemory_compressed_batch_is_smaller_than_plaintext() {
     // A batch large enough to be compressed must be stored compressed in the in-memory
-    // queue, not as plaintext.
+    // queue, not as plaintext. Compression must be opted into (E022 gate defaults OFF).
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            let pad = "lorem ipsum dolor sit amet ".repeat(20);
+            format!("{{\"doc\":{i},\"body\":\"{pad}\"}}\n").into_bytes()
+        })
+        .collect();
+    let total_plain: usize = payloads.iter().map(|payload| payload.len()).sum();
+    let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+    )
+    .unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records(
+            "queue",
+            None,
+            payloads.iter().map(|payload| payload.as_slice()),
+        )
+        .unwrap();
+    let usage = record_log.resource_usage();
+    assert!(
+        usage.memory_used_bytes < total_plain / 2,
+        "in-memory queue used {} bytes for {} plaintext bytes",
+        usage.memory_used_bytes,
+        total_plain
+    );
+}
+
+#[test]
+fn test_inmemory_plaintext_when_compression_disabled() {
+    // With the E022 gate at its default (OFF) the writer leaves records uncompressed,
+    // so the in-memory queue must hold the plaintext, not a compressed batch.
     let tempdir = tempfile::tempdir().unwrap();
     let payloads: Vec<Vec<u8>> = (0..2_000)
         .map(|i| {
@@ -516,11 +551,64 @@ fn test_inmemory_compressed_batch_is_smaller_than_plaintext() {
         .unwrap();
     let usage = record_log.resource_usage();
     assert!(
-        usage.memory_used_bytes < total_plain / 2,
-        "in-memory queue used {} bytes for {} plaintext bytes",
+        usage.memory_used_bytes >= total_plain,
+        "in-memory queue used only {} bytes for {} plaintext bytes with compression disabled",
         usage.memory_used_bytes,
         total_plain
     );
+    // The records must still read back byte-identically.
+    let records: Vec<Vec<u8>> = record_log
+        .range("queue", ..)
+        .unwrap()
+        .map(|record| record.payload.into_owned())
+        .collect();
+    assert_eq!(records, payloads);
+}
+
+#[test]
+fn test_compressed_crash_recovery_is_identity() {
+    // Process-crash simulation with compression ON: copy the WAL files while the writer
+    // is still alive (so dropping it cannot flush), then reopen and replay. The reader
+    // is unconditional, so the compressed frames must decode to the identical sequence.
+    let tempdir = tempfile::tempdir().unwrap();
+    let crash_dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| format!("{{\"doc\":{i},\"body\":\"a repeated log line body\"}}\n").into_bytes())
+        .collect();
+    {
+        let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+            tempdir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        record_log.create_queue("queue").unwrap();
+        record_log
+            .append_records(
+                "queue",
+                None,
+                payloads.iter().map(|payload| payload.as_slice()),
+            )
+            .unwrap();
+        for entry in std::fs::read_dir(tempdir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), crash_dir.path().join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    // Reopen with the gate OFF (the default): reading compressed frames stays unconditional.
+    let recovered = MultiRecordLog::open_with_prefs(
+        crash_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+    )
+    .unwrap();
+    let records: Vec<Vec<u8>> = recovered
+        .range("queue", ..)
+        .unwrap()
+        .map(|record| record.payload.into_owned())
+        .collect();
+    assert_eq!(records, payloads);
 }
 
 #[test]
