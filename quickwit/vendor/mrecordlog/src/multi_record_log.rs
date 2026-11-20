@@ -8,7 +8,7 @@ use tracing::{debug, event_enabled, info, warn, Level};
 use crate::error::{
     AppendError, CreateQueueError, DeleteQueueError, MissingQueue, ReadRecordError, TruncateError,
 };
-use crate::mem::{MemQueue, QueuesSummary};
+use crate::mem::{MemQueue, QueuesSummary, RecordLocation};
 use crate::record::{
     MultiPlexedRecord, MultiRecord, MULTIPLEXED_RECORD_HEADER_LEN, MULTIRECORD_ENTRY_HEADER_LEN,
 };
@@ -356,6 +356,20 @@ impl MultiRecordLog {
         R: RangeBounds<u64> + 'static,
     {
         self.in_mem_queues.range(queue, range)
+    }
+
+    /// Returns the locations of the records in `range` without decompressing their
+    /// batches. Decode them with [`crate::RecordLocations::into_records`] after releasing
+    /// the WAL read lock.
+    pub fn record_locations<R>(
+        &self,
+        queue: &str,
+        range: R,
+    ) -> Result<impl Iterator<Item = RecordLocation> + '_, MissingQueue>
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        self.in_mem_queues.record_locations(queue, range)
     }
 
     /// Flush if the policy says it should be done

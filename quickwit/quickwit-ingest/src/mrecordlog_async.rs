@@ -18,7 +18,7 @@ use std::path::Path;
 
 use bytes::Buf;
 use mrecordlog::error::*;
-use mrecordlog::{MultiRecordLog, PersistAction, PersistPolicy, Record, ResourceUsage};
+use mrecordlog::{MultiRecordLog, PersistAction, PersistPolicy, Record, RecordLocation, ResourceUsage};
 use tokio::task::JoinError;
 use tracing::{Span, error, info_span, instrument};
 
@@ -204,6 +204,20 @@ impl MultiRecordLogAsync {
         R: RangeBounds<u64> + 'static,
     {
         self.mrecordlog_ref().range(queue, range)
+    }
+
+    /// Returns the locations of the records in `range` without decompressing their
+    /// batches. Collect them (e.g. into [`RecordLocations`]) while the WAL read lock is
+    /// held, then decode after releasing the lock.
+    pub fn record_locations<R>(
+        &self,
+        queue: &str,
+        range: R,
+    ) -> Result<impl Iterator<Item = RecordLocation> + '_, MissingQueue>
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        self.mrecordlog_ref().record_locations(queue, range)
     }
 
     pub fn queue_exists(&self, queue: &str) -> bool {

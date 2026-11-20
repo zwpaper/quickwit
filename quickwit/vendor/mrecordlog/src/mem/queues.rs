@@ -4,7 +4,7 @@ use std::ops::{RangeBounds, RangeToInclusive};
 use tracing::{info, warn};
 
 use crate::error::{AlreadyExists, AppendError, MissingQueue};
-use crate::mem::{MemQueue, QueuesSummary};
+use crate::mem::{MemQueue, QueuesSummary, RecordLocation};
 use crate::rolling::FileNumber;
 use crate::Record;
 
@@ -61,6 +61,21 @@ impl MemQueues {
     {
         if let Some(queue) = self.queues.get(queue) {
             Ok(queue.range(range))
+        } else {
+            Err(MissingQueue(queue.to_string()))
+        }
+    }
+
+    pub fn record_locations<R>(
+        &self,
+        queue: &str,
+        range: R,
+    ) -> Result<impl Iterator<Item = RecordLocation> + '_, MissingQueue>
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        if let Some(queue) = self.queues.get(queue) {
+            Ok(queue.record_locations(range))
         } else {
             Err(MissingQueue(queue.to_string()))
         }

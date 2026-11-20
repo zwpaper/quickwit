@@ -21,7 +21,7 @@ use std::sync::Arc;
 use bytes::{BufMut, BytesMut};
 use bytesize::ByteSize;
 use futures::StreamExt;
-use mrecordlog::Record;
+use mrecordlog::{Record, RecordLocations};
 use quickwit_common::metrics::{IN_FLIGHT_FETCH_STREAM, IN_FLIGHT_MULTI_FETCH_STREAM};
 use quickwit_common::retry::RetryParams;
 use quickwit_common::stream_utils::{InFlightValue, TrackedSender};
@@ -132,27 +132,40 @@ impl FetchStreamTask {
             let (mrecordlog_guard, acquired_at) =
                 track_acquire_lock("fetch_stream", "partial", self.mrecordlog.read()).await;
 
-            let Ok(mrecords) = mrecordlog_guard
-                .as_ref()
-                .expect("mrecordlog should be initialized")
-                .range(&self.queue_id, self.from_position_inclusive..)
-            else {
-                // The queue was dropped.
-                break;
-            };
-            for Record { payload, .. } in mrecords {
-                // Accept at least one message
-                if !mrecord_buffer.is_empty()
-                    && (mrecord_buffer.len() + payload.len() > mrecord_buffer.capacity())
-                {
-                    has_drained_queue = false;
+            // Locate the records to fetch and clone their (possibly compressed) batches while
+            // holding the read lock, but defer the decompression to after the lock is
+            // released. Decompressing under the read lock used to block the `persist` write
+            // lock; `into_records` below now runs with no WAL lock held.
+            let mut locations = RecordLocations::new();
+            {
+                let Ok(record_locations) = mrecordlog_guard
+                    .as_ref()
+                    .expect("mrecordlog should be initialized")
+                    .record_locations(&self.queue_id, self.from_position_inclusive..)
+                else {
+                    // The queue was dropped.
                     break;
+                };
+                let mut planned_num_bytes = 0usize;
+                for location in record_locations {
+                    // Accept at least one message
+                    if planned_num_bytes > 0
+                        && planned_num_bytes + location.len() > mrecord_buffer.capacity()
+                    {
+                        has_drained_queue = false;
+                        break;
+                    }
+                    planned_num_bytes += location.len();
+                    locations.push(location);
                 }
+            }
+            // Drop the lock while we decompress and send the message.
+            drop(mrecordlog_guard);
+
+            for Record { payload, .. } in locations.into_records() {
                 mrecord_buffer.put(payload.borrow());
                 mrecord_lengths.push(payload.len() as u32);
             }
-            // Drop the lock while we send the message.
-            drop(mrecordlog_guard);
 
             warn_on_long_lock_hold("fetch_stream", "partial", acquired_at);
 

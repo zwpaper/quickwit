@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::{Bound, RangeBounds, RangeToInclusive};
+use std::sync::Arc;
 
 use crate::error::AppendError;
 use crate::mem::QueueSummary;
@@ -32,6 +33,107 @@ struct RecordMeta {
 struct Batch {
     bytes: Vec<u8>,
     is_compressed: bool,
+}
+
+/// A cheaply cloneable handle to one append batch's bytes (compressed or plaintext).
+///
+/// Cloning a `RecordBatch` is an `Arc` refcount bump: a fetch path can collect the
+/// batches it needs while holding the WAL read lock and decode them after the lock has
+/// been released.
+#[derive(Clone)]
+pub struct RecordBatch {
+    inner: Arc<Batch>,
+}
+
+/// The location of one record inside an append batch, collected under the WAL read lock.
+///
+/// The batch bytes are kept alive by the [`RecordBatch`] handle, so the payload can be
+/// decoded safely after the read lock is released.
+pub struct RecordLocation {
+    position: u64,
+    offset: usize,
+    len: usize,
+    batch: RecordBatch,
+}
+
+impl RecordLocation {
+    /// Position of the record in the queue.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Length in bytes of the record payload.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// A set of [`RecordLocation`]s collected under the WAL read lock.
+///
+/// Calling [`RecordLocations::into_records`] after the lock has been released decodes the
+/// (possibly compressed) batches into owned [`Record`] payloads without holding any WAL lock.
+#[derive(Default)]
+pub struct RecordLocations {
+    locations: Vec<RecordLocation>,
+}
+
+impl RecordLocations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            locations: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn push(&mut self, location: RecordLocation) {
+        self.locations.push(location);
+    }
+
+    pub fn len(&self) -> usize {
+        self.locations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.locations.is_empty()
+    }
+
+    /// Decodes the collected batches into owned records, decompressing each batch at most
+    /// once. The decoded `(position, payload)` sequence is identical to
+    /// [`MemQueue::range`].
+    pub fn into_records(self) -> impl Iterator<Item = Record<'static>> {
+        let mut decompressor = zstd::bulk::Decompressor::new().ok();
+        let mut plain_buffer: Vec<u8> = Vec::new();
+        let mut current_batch: Option<RecordBatch> = None;
+        self.locations.into_iter().map(move |location| {
+            let is_new_batch = current_batch
+                .as_ref()
+                .map_or(true, |current| !Arc::ptr_eq(&current.inner, &location.batch.inner));
+            if is_new_batch {
+                location
+                    .batch
+                    .inner
+                    .write_plain_into(decompressor.as_mut(), &mut plain_buffer);
+                current_batch = Some(location.batch.clone());
+            }
+            let end = location.offset + location.len;
+            let payload = if end <= plain_buffer.len() {
+                Cow::Owned(plain_buffer[location.offset..end].to_vec())
+            } else {
+                Cow::Owned(Vec::new())
+            };
+            Record {
+                position: location.position,
+                payload,
+            }
+        })
+    }
 }
 
 impl Batch {
@@ -74,8 +176,9 @@ impl Batch {
 #[derive(Default)]
 pub(crate) struct MemQueue {
     // Consecutive records, grouped by append batch and stored compressed when the
-    // writer compressed them for disk.
-    batches: VecDeque<Batch>,
+    // writer compressed them for disk. The `Arc` makes a batch handle cheap to clone so
+    // the fetch path can release the read lock before decompressing.
+    batches: VecDeque<Arc<Batch>>,
     start_position: u64,
     record_metas: Vec<RecordMeta>,
 }
@@ -203,10 +306,10 @@ impl MemQueue {
                 len,
             });
         }
-        self.batches.push_back(Batch {
+        self.batches.push_back(Arc::new(Batch {
             bytes: blob,
             is_compressed,
-        });
+        }));
         Ok(())
     }
 
@@ -237,9 +340,12 @@ impl MemQueue {
             .binary_search_by_key(&position, |record| record.position)
     }
 
-    pub fn range<R>(&self, range: R) -> impl Iterator<Item = Record<'_>> + '_
-    where R: RangeBounds<u64> + 'static {
-        let start_idx: usize = match range.start_bound() {
+    /// Returns the index of the first record at or after the start bound of `range`.
+    fn range_start_idx<R>(&self, range: &R) -> usize
+    where
+        R: RangeBounds<u64>,
+    {
+        match range.start_bound() {
             Bound::Included(&start_from) => {
                 // if pos is included, we can use position_to_idx result directly
                 self.position_to_idx(start_from)
@@ -253,7 +359,41 @@ impl MemQueue {
                     .unwrap_or_else(std::convert::identity)
             }
             Bound::Unbounded => 0,
-        };
+        }
+    }
+
+    /// Returns the locations of the records in `range`, without decompressing any batch.
+    ///
+    /// Each item keeps its batch alive through a [`RecordBatch`] handle, so the caller may
+    /// release the WAL read lock and decode the payloads afterwards with
+    /// [`RecordLocations::into_records`]. The decoded `(position, payload)` sequence is
+    /// identical to [`MemQueue::range`].
+    pub fn record_locations<R>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = RecordLocation> + '_
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        let start_idx = self.range_start_idx(&range);
+        (start_idx..self.record_metas.len())
+            .take_while(move |idx| range.contains(&self.record_metas[*idx].position))
+            .map(move |idx| {
+                let record_meta = &self.record_metas[idx];
+                RecordLocation {
+                    position: record_meta.position,
+                    offset: record_meta.offset,
+                    len: record_meta.len,
+                    batch: RecordBatch {
+                        inner: self.batches[record_meta.batch_idx].clone(),
+                    },
+                }
+            })
+    }
+
+    pub fn range<R>(&self, range: R) -> impl Iterator<Item = Record<'_>> + '_
+    where R: RangeBounds<u64> + 'static {
+        let start_idx: usize = self.range_start_idx(&range);
         let mut decompressor = zstd::bulk::Decompressor::new().ok();
         let mut plain_buffer: Vec<u8> = Vec::new();
         let mut current_batch_idx: Option<usize> = None;
@@ -316,7 +456,7 @@ impl MemQueue {
             .iter()
             .map(|batch| batch.bytes.capacity())
             .sum::<usize>()
-            + self.batches.capacity() * std::mem::size_of::<Batch>()
+            + self.batches.capacity() * std::mem::size_of::<Arc<Batch>>()
             + self.record_metas.capacity() * std::mem::size_of::<RecordMeta>()
     }
 }

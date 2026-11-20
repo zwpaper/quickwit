@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use bytes::Buf;
 
-use crate::{MultiRecordLog, PersistAction, PersistPolicy, Record};
+use crate::{MultiRecordLog, PersistAction, PersistPolicy, Record, RecordLocations};
 
 fn read_all_records<'a>(multi_record_log: &'a MultiRecordLog, queue: &str) -> Vec<Cow<'a, [u8]>> {
     let mut records = Vec::new();
@@ -644,5 +644,49 @@ fn test_compressed_batch_mid_truncate_and_reopen() {
         assert_eq!(records.len(), 1_500);
         assert_eq!(&records[0].payload[..], &payloads[500][..]);
         assert_eq!(&records[1_499].payload[..], &payloads[1_999][..]);
+    }
+}
+
+#[test]
+fn test_record_locations_decode_identical_to_range() {
+    // `record_locations().into_records()` must decode the exact same `(position, payload)`
+    // sequence as `range()`, for compressed batches, after truncation, and with an
+    // exclusive start bound. This is the fetch path used to release the WAL read lock
+    // before decompressing.
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            let pad = "lorem ipsum dolor sit amet ".repeat(20);
+            format!("{{\"doc\":{i},\"body\":\"{pad}\"}}\n").into_bytes()
+        })
+        .collect();
+    let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+    )
+    .unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records(
+            "queue",
+            None,
+            payloads.iter().map(|payload| payload.as_slice()),
+        )
+        .unwrap();
+    record_log.truncate("queue", ..=499).unwrap();
+
+    for range in [0u64.., 500.., 1_000.., 1_999..] {
+        let via_range: Vec<Record<'_>> = record_log.range("queue", range.clone()).unwrap().collect();
+        let mut locations = RecordLocations::new();
+        for location in record_log.record_locations("queue", range).unwrap() {
+            locations.push(location);
+        }
+        let via_locations: Vec<Record<'static>> = locations.into_records().collect();
+        assert_eq!(via_locations.len(), via_range.len());
+        for (expected, actual) in via_range.iter().zip(&via_locations) {
+            assert_eq!(actual.position, expected.position);
+            assert_eq!(&actual.payload[..], &expected.payload[..]);
+        }
     }
 }
