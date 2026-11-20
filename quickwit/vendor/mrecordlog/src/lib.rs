@@ -1,0 +1,97 @@
+use std::borrow::Cow;
+
+mod block_read_write;
+
+pub use block_read_write::{BlockRead, BlockWrite, BLOCK_NUM_BYTES};
+pub mod error;
+mod frame;
+mod mem;
+mod multi_record_log;
+mod persist_policy;
+mod record;
+mod recordlog;
+mod rolling;
+
+pub use mem::{QueueSummary, QueuesSummary};
+pub use multi_record_log::MultiRecordLog;
+pub(crate) use persist_policy::PersistState;
+pub use persist_policy::{PersistAction, PersistPolicy};
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Record<'a> {
+    pub position: u64,
+    pub payload: Cow<'a, [u8]>,
+}
+
+impl<'a> Record<'a> {
+    pub fn new(position: u64, payload: &'a [u8]) -> Self {
+        Record {
+            position,
+            payload: Cow::Borrowed(payload),
+        }
+    }
+}
+
+/// Resources used by mrecordlog
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceUsage {
+    /// Actual size of the memory used
+    pub memory_used_bytes: usize,
+    /// Capacity allocated, a part of which may be unused right now
+    pub memory_allocated_bytes: usize,
+    /// Disk size used
+    pub disk_used_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendOutcome {
+    /// Position of the last record appended, or `None` for an idempotent no-op
+    /// (empty payloads, or `position_opt` already past the queue's head).
+    pub last_position: Option<u64>,
+    /// Bytes appended to the WAL: frame headers + payload + any end-of-block padding
+    /// written ahead of the record. Two identical calls may report different values
+    /// depending on where the write cursor sat within the current block (a frame crossing
+    /// a block boundary incurs padding). `0` for an idempotent no-op.
+    pub wal_bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncateOutcome {
+    /// Number of records evicted from the in-memory queue by this call. This is a delta:
+    /// a truncate at a position already covered by a previous truncate reports `0`.
+    pub evicted_records: usize,
+    pub wal_bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteQueueOutcome {
+    pub wal_bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateQueueOutcome {
+    pub wal_bytes_written: u64,
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod proptests;
+
+pub trait Serializable<'a>: Sized {
+    /// Clears the buffer first.
+    fn serialize(&self, buffer: &mut Vec<u8>);
+    fn deserialize(buffer: &'a [u8]) -> Option<Self>;
+}
+
+impl<'a> Serializable<'a> for &'a str {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.clear();
+        buffer.extend_from_slice(self.as_bytes())
+    }
+
+    fn deserialize(buffer: &'a [u8]) -> Option<Self> {
+        std::str::from_utf8(buffer).ok()
+    }
+}
