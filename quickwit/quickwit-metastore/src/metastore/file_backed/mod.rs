@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -61,7 +62,7 @@ use quickwit_proto::metastore::{
 use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, watch};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
@@ -148,6 +149,8 @@ pub struct FileBackedMetastore {
     state: Arc<RwLock<MetastoreState>>,
     storage: Arc<dyn Storage>,
     polling_interval_opt: Option<Duration>,
+    /// One coalescing writer per index id, created on first mutation. See [`IndexWriter`].
+    writers: Arc<Mutex<HashMap<String, Arc<IndexWriter>>>>,
 }
 
 impl fmt::Debug for FileBackedMetastore {
@@ -159,6 +162,181 @@ impl fmt::Debug for FileBackedMetastore {
     }
 }
 
+/// Coalescing writer for a single index.
+///
+/// [`FileBackedMetastore::mutate`] applies a mutation to the in-memory `FileBackedIndex` under the
+/// per-index lock and then hands the new snapshot to this writer instead of awaiting a full
+/// `put_index` under that lock. A burst of N concurrent mutations is collapsed to at most two
+/// full-index storage writes (the latest snapshot wins), and only the caller that owns the flush
+/// loop awaits the storage writes.
+///
+/// Durability: every caller returns only after a snapshot at least as new as its own mutation has
+/// been persisted. Each mutation is tagged with a sequence number assigned under the per-index
+/// lock, so the sequence order matches the order in which mutations were applied to the in-memory
+/// index (the snapshots therefore grow monotonically). The writer only enqueues a snapshot whose
+/// sequence is higher than the one already queued, so it can never persist a stale snapshot over a
+/// newer one, and the persisted sequence only moves forward.
+///
+/// On a flush error the error is surfaced to the flush leader and to every caller waiting on that
+/// flush; the caller then discards the in-memory cache, so a stale snapshot can never overwrite a
+/// newer on-storage state.
+struct IndexWriter {
+    storage: Arc<dyn Storage>,
+    /// Monotone mutation sequence, assigned by [`FileBackedMetastore::mutate`] while it holds the
+    /// per-index lock.
+    next_seq: AtomicU64,
+    pending: Mutex<PendingFlush>,
+    /// Broadcasts flush progress to the callers waiting for their snapshot to be persisted.
+    progress_tx: watch::Sender<WriterProgress>,
+}
+
+/// Flush progress broadcast to the callers waiting on [`IndexWriter`].
+#[derive(Clone, Debug)]
+enum WriterProgress {
+    /// A snapshot including every mutation up to this sequence has been persisted.
+    Persisted(u64),
+    /// The flush of the pending snapshot failed. Callers whose mutation is not already covered by
+    /// `persisted_seq` must fail and discard the cache.
+    Failed {
+        persisted_seq: u64,
+        error: MetastoreError,
+    },
+}
+
+#[derive(Default)]
+struct PendingFlush {
+    /// Latest snapshot waiting to be persisted, with the mutation sequence it includes. Superseded
+    /// only by a snapshot carrying a higher sequence.
+    snapshot: Option<(FileBackedIndex, u64)>,
+    /// Whether a caller currently owns the flush loop.
+    flushing: bool,
+    /// Sequence of the latest snapshot known to be durable.
+    persisted_seq: u64,
+}
+
+impl IndexWriter {
+    fn new(storage: Arc<dyn Storage>) -> Self {
+        Self {
+            storage,
+            next_seq: AtomicU64::new(0),
+            pending: Mutex::new(PendingFlush::default()),
+            progress_tx: watch::channel(WriterProgress::Persisted(0)).0,
+        }
+    }
+
+    /// Assigns the next mutation sequence number. Called while the per-index lock is held so that
+    /// the sequence order matches the in-memory mutation order.
+    fn next_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Enqueues `snapshot` (which includes every mutation up to `seq`) and persists it.
+    ///
+    /// The first caller of a burst becomes the flush leader and awaits the storage writes; the
+    /// other callers wait until a snapshot at least as new as theirs has been persisted.
+    async fn submit(&self, snapshot: FileBackedIndex, seq: u64) -> MetastoreResult<()> {
+        let mut pending = self.pending.lock().await;
+        // A caller can reach `submit` out of order relative to its own mutation (the per-index lock
+        // is released before the storage write), so a snapshot older than the persisted state must
+        // never be enqueued: its mutation is already covered by a newer snapshot.
+        if seq <= pending.persisted_seq {
+            return Ok(());
+        }
+        let should_enqueue = match &pending.snapshot {
+            Some((_, pending_seq)) => seq > *pending_seq,
+            None => true,
+        };
+        if should_enqueue {
+            pending.snapshot = Some((snapshot, seq));
+        }
+        if pending.flushing {
+            drop(pending);
+            return self.wait_until_persisted(seq).await;
+        }
+        pending.flushing = true;
+        drop(pending);
+        self.flush_loop().await
+    }
+
+    /// Persists pending snapshots until none is left. Only the flush leader runs this loop.
+    async fn flush_loop(&self) -> MetastoreResult<()> {
+        loop {
+            let (snapshot, seq, already_persisted) = {
+                let mut pending = self.pending.lock().await;
+                match pending.snapshot.take() {
+                    Some((snapshot, seq)) => (snapshot, seq, seq <= pending.persisted_seq),
+                    None => {
+                        pending.flushing = false;
+                        return Ok(());
+                    }
+                }
+            };
+            // A newer snapshot may have been persisted while this stale one was queued; never let
+            // it overwrite the newer on-storage state.
+            if already_persisted {
+                continue;
+            }
+            match put_index(&*self.storage, &snapshot).await {
+                Ok(()) => {
+                    let persisted_seq = {
+                        let mut pending = self.pending.lock().await;
+                        pending.persisted_seq = pending.persisted_seq.max(seq);
+                        pending.persisted_seq
+                    };
+                    self.progress_tx
+                        .send_replace(WriterProgress::Persisted(persisted_seq));
+                }
+                Err(error) => {
+                    let persisted_seq = {
+                        let mut pending = self.pending.lock().await;
+                        pending.snapshot = None;
+                        pending.flushing = false;
+                        pending.persisted_seq
+                    };
+                    self.progress_tx.send_replace(WriterProgress::Failed {
+                        persisted_seq,
+                        error: error.clone(),
+                    });
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Waits until a snapshot at least as new as `seq` has been persisted, or until the flush that
+    /// covers it fails.
+    async fn wait_until_persisted(&self, seq: u64) -> MetastoreResult<()> {
+        let mut receiver = self.progress_tx.subscribe();
+        loop {
+            {
+                let progress = receiver.borrow_and_update();
+                match &*progress {
+                    WriterProgress::Persisted(persisted_seq) if *persisted_seq >= seq => {
+                        return Ok(());
+                    }
+                    WriterProgress::Failed {
+                        persisted_seq,
+                        error,
+                    } => {
+                        if *persisted_seq >= seq {
+                            return Ok(());
+                        }
+                        return Err(error.clone());
+                    }
+                    WriterProgress::Persisted(_) => {}
+                }
+            }
+            if receiver.changed().await.is_err() {
+                return Err(MetastoreError::Internal {
+                    message: "metastore writer was dropped while waiting for a snapshot"
+                        .to_string(),
+                    cause: String::new(),
+                });
+            }
+        }
+    }
+}
+
 impl FileBackedMetastore {
     /// Creates a [`FileBackedMetastore`] for tests.
     #[doc(hidden)]
@@ -167,6 +345,7 @@ impl FileBackedMetastore {
             state: Default::default(),
             storage,
             polling_interval_opt: None,
+            writers: Default::default(),
         }
     }
 
@@ -199,8 +378,48 @@ impl FileBackedMetastore {
             state: Arc::new(RwLock::new(state)),
             storage,
             polling_interval_opt,
+            writers: Default::default(),
         };
         Ok(metastore)
+    }
+
+    /// Returns the coalescing writer for `index_id`, creating it on first use.
+    async fn writer(&self, index_id: &str) -> Arc<IndexWriter> {
+        let mut writers = self.writers.lock().await;
+        writers
+            .entry(index_id.to_string())
+            .or_insert_with(|| Arc::new(IndexWriter::new(self.storage.clone())))
+            .clone()
+    }
+
+    /// Drops the cached in-memory index after a failed flush.
+    ///
+    /// Mirrors the non-coalesced error path: the on-storage content may be partially written, so
+    /// the cache is discarded and the index is reloaded from storage on the next access.
+    async fn discard_cached_index(&self, index_id: &str) {
+        // Grab the live index mutex before taking the state lock and mark it discarded so that
+        // concurrent holders re-fetch. This keeps the lock order (index mutex, then state lock)
+        // consistent with the rest of the metastore.
+        let index_mutex_opt = {
+            let state_rlock_guard = self.state.read().await;
+            match state_rlock_guard.indexes.get(index_id) {
+                Some(LazyIndexStatus::Active(lazy_index)) => lazy_index.get_loaded(),
+                _ => None,
+            }
+        };
+        if let Some(index_mutex) = index_mutex_opt {
+            index_mutex.lock().await.discarded = true;
+        }
+        let mut state_wlock_guard = self.state.write().await;
+        state_wlock_guard.indexes.insert(
+            index_id.to_string(),
+            LazyIndexStatus::Active(LazyFileBackedIndex::new(
+                self.storage.clone(),
+                index_id.to_string(),
+                self.polling_interval_opt,
+                None,
+            )),
+        );
     }
 
     async fn mutate<T>(
@@ -209,46 +428,42 @@ impl FileBackedMetastore {
         mutate_fn: impl FnOnce(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
     ) -> MetastoreResult<T> {
         let index_id = &index_uid.index_id;
-        let mut locked_index = self.get_locked_index(index_id).await?;
-        if locked_index.index_uid() != index_uid {
-            return Err(MetastoreError::NotFound(EntityKind::Index {
-                index_id: index_id.to_string(),
-            }));
-        }
-        let mut index = locked_index.clone();
-
-        let value = match mutate_fn(&mut index)? {
-            MutationOccurred::Yes(value) => value,
-            MutationOccurred::No(value) => {
-                return Ok(value);
+        // Fetch the coalescing writer up front: the mutation sequence number must be assigned under
+        // the per-index lock (i.e. in the order the mutations are applied to the in-memory index)
+        // so that the writer can never persist a stale snapshot over a newer one.
+        let writer = self.writer(index_id).await;
+        // Apply the mutation to the in-memory index under the per-index lock, then release the lock
+        // before persisting. The storage write is coalesced by the per-index single-flight writer,
+        // so a burst of concurrent mutations no longer serializes one full `put_index` round-trip
+        // per mutation on the critical path.
+        let (snapshot, seq, value) = {
+            let mut locked_index = self.get_locked_index(index_id).await?;
+            if locked_index.index_uid() != index_uid {
+                return Err(MetastoreError::NotFound(EntityKind::Index {
+                    index_id: index_id.to_string(),
+                }));
             }
+            let mut index = locked_index.clone();
+
+            let value = match mutate_fn(&mut index)? {
+                MutationOccurred::Yes(value) => value,
+                MutationOccurred::No(value) => {
+                    return Ok(value);
+                }
+            };
+            locked_index.set_recently_modified();
+            // Readers observe the mutation immediately; only its persistence is deferred.
+            *locked_index = index.clone();
+            let seq = writer.next_seq();
+            (index, seq, value)
         };
-        locked_index.set_recently_modified();
 
-        let put_result = put_index(&*self.storage, &index).await;
-        match put_result {
-            Ok(()) => {
-                *locked_index = index;
-                Ok(value)
-            }
+        match writer.submit(snapshot, seq).await {
+            Ok(()) => Ok(value),
             Err(error) => {
-                // For some of the error type here, we cannot know for sure
-                // whether the content was written or not.
-                //
-                // Just to be sure, let's discard the cache.
-                let mut state_wlock_guard = self.state.write().await;
-
-                // At this point, we hold both locks.
-                state_wlock_guard.indexes.insert(
-                    index_id.to_string(),
-                    LazyIndexStatus::Active(LazyFileBackedIndex::new(
-                        self.storage.clone(),
-                        index_id.to_string(),
-                        self.polling_interval_opt,
-                        None,
-                    )),
-                );
-                locked_index.discarded = true;
+                // For some of the error types here, we cannot know for sure whether the content was
+                // written or not, so discard the cache and reload from storage on the next access.
+                self.discard_cached_index(index_id).await;
                 Err(error)
             }
         }
@@ -631,6 +846,7 @@ impl MetastoreService for FileBackedMetastore {
             Ok(()) | Err(MetastoreError::NotFound(EntityKind::Index { .. }))
         ) {
             state_wlock_guard.indexes.remove(index_id);
+            self.writers.lock().await.remove(index_id);
             let manifest = state_wlock_guard.as_manifest();
 
             if let Err(error) = save_manifest(&*self.storage, &manifest).await {
@@ -1373,9 +1589,11 @@ impl crate::tests::DefaultForTest for FileBackedMetastore {
 #[cfg(test)]
 mod tests {
 
-    use std::ops::RangeInclusive;
+    use std::ffi::OsStr;
+    use std::ops::{Range, RangeInclusive};
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use futures::executor::block_on;
     use quickwit_common::uri::{Protocol, Uri};
@@ -1384,13 +1602,17 @@ mod tests {
     use quickwit_proto::metastore::{DeleteQuery, MetastoreError};
     use quickwit_proto::types::SourceId;
     use quickwit_query::query_ast::qast_helper;
-    use quickwit_storage::{MockStorage, RamStorage, Storage, StorageErrorKind};
+    use quickwit_storage::{
+        BulkDeleteError, ListObjectsStream, MockStorage, OwnedBytes, PutPayload, RamStorage,
+        SendableAsync, Storage, StorageError, StorageErrorKind, StorageResult,
+    };
     use rand::RngExt;
     use tests::manifest::{IndexStatus, Manifest};
     use time::OffsetDateTime;
+    use tokio::io::AsyncRead;
     use tokio::time::Duration;
 
-    use super::store_operations::{metastore_filepath, put_index_given_index_id};
+    use super::store_operations::{METASTORE_FILE_NAME, metastore_filepath, put_index_given_index_id};
     use super::*;
     use crate::metastore::MetastoreServiceStreamSplitsExt;
     use crate::tests::DefaultForTest;
@@ -2442,5 +2664,376 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    /// E014 pre-check storage proxy. It counts `put` calls, adds a fixed latency to each one,
+    /// records the latest persisted index snapshot, and can be switched into failing every put. It
+    /// reproduces the serialized cost and the durability semantics of the file-backed metastore
+    /// write path in a unit test instead of a 10m benchmark run.
+    #[derive(Debug)]
+    struct CountingPutStorage {
+        inner: Arc<dyn Storage>,
+        num_puts: Arc<AtomicUsize>,
+        num_index_puts: Arc<AtomicUsize>,
+        put_latency: Duration,
+        fail: Arc<AtomicBool>,
+        index_snapshots: Arc<tokio::sync::Mutex<Vec<FileBackedIndex>>>,
+    }
+
+    /// Read side of [`CountingPutStorage`].
+    #[derive(Clone, Debug)]
+    struct CountingPutHandle {
+        num_puts: Arc<AtomicUsize>,
+        num_index_puts: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+        index_snapshots: Arc<tokio::sync::Mutex<Vec<FileBackedIndex>>>,
+    }
+
+    impl CountingPutStorage {
+        fn new(
+            inner: Arc<dyn Storage>,
+            put_latency: Duration,
+        ) -> (Arc<dyn Storage>, CountingPutHandle) {
+            let num_puts = Arc::new(AtomicUsize::new(0));
+            let num_index_puts = Arc::new(AtomicUsize::new(0));
+            let fail = Arc::new(AtomicBool::new(false));
+            let index_snapshots = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let storage = Arc::new(Self {
+                inner,
+                num_puts: num_puts.clone(),
+                num_index_puts: num_index_puts.clone(),
+                put_latency,
+                fail: fail.clone(),
+                index_snapshots: index_snapshots.clone(),
+            });
+            let handle = CountingPutHandle {
+                num_puts,
+                num_index_puts,
+                fail,
+                index_snapshots,
+            };
+            (storage, handle)
+        }
+    }
+
+    #[async_trait]
+    impl Storage for CountingPutStorage {
+        async fn check_connectivity(&self) -> anyhow::Result<()> {
+            self.inner.check_connectivity().await
+        }
+
+        async fn put(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()> {
+            self.num_puts.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(StorageErrorKind::Internal.with_error(std::io::Error::other(
+                    "simulated put failure",
+                )));
+            }
+            let bytes = payload.read_all().await.map_err(StorageError::from)?;
+            tokio::time::sleep(self.put_latency).await;
+            self.inner.put(path, Box::new(bytes.to_vec())).await?;
+            if path.file_name() == Some(OsStr::new(METASTORE_FILE_NAME)) {
+                self.num_index_puts.fetch_add(1, Ordering::SeqCst);
+                let index: FileBackedIndex =
+                    serde_utils::from_json_bytes(bytes.as_slice()).unwrap();
+                self.index_snapshots.lock().await.push(index);
+            }
+            Ok(())
+        }
+
+        async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
+            self.inner.copy_to(path, output).await
+        }
+
+        async fn get_slice(&self, path: &Path, range: Range<usize>) -> StorageResult<OwnedBytes> {
+            self.inner.get_slice(path, range).await
+        }
+
+        async fn get_slice_stream(
+            &self,
+            path: &Path,
+            range: Range<usize>,
+        ) -> StorageResult<Box<dyn AsyncRead + Send + Unpin>> {
+            self.inner.get_slice_stream(path, range).await
+        }
+
+        async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
+            self.inner.get_all(path).await
+        }
+
+        async fn delete(&self, path: &Path) -> StorageResult<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn bulk_delete<'a>(&self, paths: &[&'a Path]) -> Result<(), BulkDeleteError> {
+            self.inner.bulk_delete(paths).await
+        }
+
+        fn list(&self, prefix: &Path) -> ListObjectsStream {
+            self.inner.list(prefix)
+        }
+
+        async fn exists(&self, path: &Path) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn file_num_bytes(&self, path: &Path) -> StorageResult<u64> {
+            self.inner.file_num_bytes(path).await
+        }
+
+        fn uri(&self) -> &Uri {
+            self.inner.uri()
+        }
+    }
+
+    async fn e014_create_index(metastore: &FileBackedMetastore, index_id: &str) -> IndexUid {
+        let index_uri = format!("ram:///indexes/{index_id}");
+        let index_config = IndexConfig::for_test(index_id, &index_uri);
+        let create_index_request = CreateIndexRequest::try_from_index_config(&index_config).unwrap();
+        metastore
+            .create_index(create_index_request)
+            .await
+            .unwrap()
+            .index_uid()
+            .clone()
+    }
+
+    /// Returns whether the latest persisted index snapshot contains `split_id` in
+    /// `expected_state`.
+    async fn e014_is_durable(
+        handle: &CountingPutHandle,
+        index_uid: &IndexUid,
+        split_id: &str,
+        expected_state: SplitState,
+    ) -> bool {
+        let snapshots = handle.index_snapshots.lock().await;
+        let Some(index) = snapshots.last() else {
+            return false;
+        };
+        let query = ListSplitsQuery::for_index(index_uid.clone());
+        index.list_splits(&query).unwrap().iter().any(|split| {
+            split.split_id().to_string() == split_id && split.split_state == expected_state
+        })
+    }
+
+    /// Fires `split_ids.len()` concurrent `stage_splits`, all released together, and returns for
+    /// each caller whether the latest persisted snapshot contained its own staged split at the
+    /// moment it returned.
+    async fn e014_stage_burst(
+        metastore: &FileBackedMetastore,
+        handle: &CountingPutHandle,
+        index_uid: &IndexUid,
+        split_ids: &[String],
+    ) -> Vec<bool> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(split_ids.len()));
+        let mut tasks = Vec::with_capacity(split_ids.len());
+        for split_id in split_ids {
+            let metastore = metastore.clone();
+            let index_uid = index_uid.clone();
+            let split_id = split_id.clone();
+            let barrier = barrier.clone();
+            let handle = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let split_metadata = SplitMetadata {
+                    split_id: split_id.clone().into(),
+                    index_uid: index_uid.clone(),
+                    ..Default::default()
+                };
+                let request =
+                    StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), [split_metadata])
+                        .unwrap();
+                barrier.wait().await;
+                metastore.stage_splits(request).await.unwrap();
+                e014_is_durable(&handle, &index_uid, &split_id, SplitState::Staged).await
+            }));
+        }
+        let mut durable = Vec::with_capacity(split_ids.len());
+        for task in tasks {
+            durable.push(task.await.unwrap());
+        }
+        durable
+    }
+
+    /// Fires `split_ids.len()` concurrent `publish_splits`, all released together, and returns for
+    /// each caller whether the latest persisted snapshot contained its own published split at the
+    /// moment it returned.
+    async fn e014_publish_burst(
+        metastore: &FileBackedMetastore,
+        handle: &CountingPutHandle,
+        index_uid: &IndexUid,
+        split_ids: &[String],
+    ) -> Vec<bool> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(split_ids.len()));
+        let mut tasks = Vec::with_capacity(split_ids.len());
+        for split_id in split_ids {
+            let metastore = metastore.clone();
+            let index_uid = index_uid.clone();
+            let split_id = split_id.clone();
+            let barrier = barrier.clone();
+            let handle = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let request = PublishSplitsRequest {
+                    index_uid: Some(index_uid.clone()),
+                    staged_split_ids: vec![split_id.clone()],
+                    ..Default::default()
+                };
+                barrier.wait().await;
+                metastore.publish_splits(request).await.unwrap();
+                e014_is_durable(&handle, &index_uid, &split_id, SplitState::Published).await
+            }));
+        }
+        let mut durable = Vec::with_capacity(split_ids.len());
+        for task in tasks {
+            durable.push(task.await.unwrap());
+        }
+        durable
+    }
+
+    /// E014 pre-check. Fires `NUM_PIPELINES` concurrent `stage_splits` then `publish_splits`
+    /// against a file-backed metastore whose storage adds a fixed latency to every `put`.
+    ///
+    /// Asserts (a) the burst costs at most a small constant number of full-index writes
+    /// (coalescing) and (b) every caller returns only after the persisted snapshot contains its own
+    /// mutation (durability; the E011 defect).
+    #[tokio::test]
+    async fn e014_precheck_coalesces_writes_and_makes_every_caller_durable() {
+        const NUM_PIPELINES: usize = 16;
+        let put_latency = Duration::from_millis(50);
+        let (storage, handle) = CountingPutStorage::new(Arc::new(RamStorage::default()), put_latency);
+        let metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        let index_id = "e014-precheck";
+        let index_uid = e014_create_index(&metastore, index_id).await;
+
+        let split_ids: Vec<String> = (0..NUM_PIPELINES)
+            .map(|i| format!("{index_id}--split-{i}"))
+            .collect();
+        let index_puts_before = handle.num_index_puts.load(Ordering::SeqCst);
+
+        let stage_durable = e014_stage_burst(&metastore, &handle, &index_uid, &split_ids).await;
+        let stage_index_puts = handle.num_index_puts.load(Ordering::SeqCst) - index_puts_before;
+
+        let publish_durable = e014_publish_burst(&metastore, &handle, &index_uid, &split_ids).await;
+        let total_index_puts = handle.num_index_puts.load(Ordering::SeqCst) - index_puts_before;
+
+        println!(
+            "e014 precheck: pipelines={NUM_PIPELINES} stage_index_puts={stage_index_puts} \
+             total_index_puts={total_index_puts} put_latency_ms={} \
+             stage_durable={stage_durable:?} publish_durable={publish_durable:?}",
+            put_latency.as_millis(),
+        );
+
+        assert!(
+            stage_durable.iter().all(|durable| *durable),
+            "not every stage caller was durable at return: {stage_durable:?}"
+        );
+        assert!(
+            publish_durable.iter().all(|durable| *durable),
+            "not every publish caller was durable at return: {publish_durable:?}"
+        );
+        assert!(
+            total_index_puts <= 4,
+            "expected the metastore writes to be coalesced (<=4 full-index puts), observed \
+             {total_index_puts}"
+        );
+    }
+
+    /// E014 pre-check (error path). A simulated `put` failure must surface to the caller and
+    /// discard the in-memory cache, so the failed mutation is not observable afterwards.
+    #[tokio::test]
+    async fn e014_precheck_put_error_surfaces_and_discards_cache() {
+        let (storage, handle) =
+            CountingPutStorage::new(Arc::new(RamStorage::default()), Duration::ZERO);
+        let metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        let index_id = "e014-precheck-error";
+        let index_uid = e014_create_index(&metastore, index_id).await;
+        let split_id = format!("{index_id}--split-0");
+
+        handle.fail.store(true, Ordering::SeqCst);
+        let split_metadata = SplitMetadata {
+            split_id: split_id.clone().into(),
+            index_uid: index_uid.clone(),
+            ..Default::default()
+        };
+        let request =
+            StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), [split_metadata])
+                .unwrap();
+        let error = metastore.stage_splits(request).await.unwrap_err();
+        assert!(
+            matches!(error, MetastoreError::Internal { .. }),
+            "expected the simulated put error to surface, got {error:?}"
+        );
+
+        // The cache must have been discarded: with puts working again, the failed stage is not
+        // visible because the index is reloaded from storage.
+        handle.fail.store(false, Ordering::SeqCst);
+        let query = ListSplitsQuery::for_index(index_uid.clone());
+        let splits = metastore
+            .list_splits(ListSplitsRequest::try_from_list_splits_query(&query).unwrap())
+            .await
+            .unwrap()
+            .collect_splits()
+            .await
+            .unwrap();
+        assert!(
+            splits.is_empty(),
+            "expected the cache to be discarded after the failed flush, found {splits:?}"
+        );
+    }
+
+    /// E014 pre-check (ordering). The per-index lock is released before the storage write, so a
+    /// caller can reach the writer after a later mutation has already been submitted. The writer
+    /// must never persist that stale snapshot over the newer one.
+    #[tokio::test]
+    async fn e014_precheck_writer_never_persists_a_stale_snapshot() {
+        let (storage, handle) =
+            CountingPutStorage::new(Arc::new(RamStorage::default()), Duration::ZERO);
+        let metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        let index_id = "e014-precheck-order";
+        let index_uid = e014_create_index(&metastore, index_id).await;
+
+        let base = metastore
+            .read(&index_uid, |index| Ok(index.clone()))
+            .await
+            .unwrap();
+        let mut snap_a = base.clone();
+        snap_a
+            .stage_split(SplitMetadata {
+                split_id: format!("{index_id}--a").into(),
+                index_uid: index_uid.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut snap_b = base.clone();
+        snap_b
+            .stage_split(SplitMetadata {
+                split_id: format!("{index_id}--b").into(),
+                index_uid: index_uid.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let writer = metastore.writer(index_id).await;
+        // Submit the newer snapshot first, then the stale one; the stale submit must not overwrite
+        // the newer on-storage state.
+        writer.submit(snap_b, 2).await.unwrap();
+        writer.submit(snap_a, 1).await.unwrap();
+
+        let snapshots = handle.index_snapshots.lock().await;
+        let last = snapshots.last().expect("no index snapshot was persisted");
+        let query = ListSplitsQuery::for_index(index_uid.clone());
+        let split_ids: Vec<String> = last
+            .list_splits(&query)
+            .unwrap()
+            .iter()
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert!(
+            split_ids.contains(&format!("{index_id}--b")),
+            "the newer snapshot was overwritten by a stale one: {split_ids:?}"
+        );
+        assert!(
+            !split_ids.contains(&format!("{index_id}--a")),
+            "a stale snapshot was persisted over the newer one: {split_ids:?}"
+        );
     }
 }
