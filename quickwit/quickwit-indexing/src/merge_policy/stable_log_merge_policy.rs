@@ -134,6 +134,10 @@ impl MergePolicy for StableLogMergePolicy {
         self.compaction_operations(splits)
     }
 
+    fn post_ingest_compaction(&self) -> bool {
+        self.config.post_ingest_compaction
+    }
+
     #[cfg(test)]
     fn check_is_valid(&self, merge_op: &MergeOperation, _remaining_splits: &[SplitMetadata]) {
         assert!(merge_op.splits_as_slice().len() <= self.config.max_merge_factor);

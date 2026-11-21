@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
@@ -33,6 +33,15 @@ use crate::models::NewSplits;
 
 #[derive(Debug)]
 pub(crate) struct RunFinalizeMergePolicyAndQuit;
+
+/// E041: periodic self-message that drives the optional post-ingest compaction pass.
+#[derive(Debug)]
+struct CompactionTick;
+
+/// How often the planner checks whether the compaction pass can run.
+const COMPACTION_TICK_INTERVAL: Duration = Duration::from_secs(5);
+/// Minimum quiet period (no new split published, no ongoing merge) before compaction runs.
+const COMPACTION_QUIET_PERIOD: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MergePartition {
@@ -87,9 +96,13 @@ pub struct MergePlanner {
     /// We use the actor start_time as a way to identify incarnations.
     ///
     /// Since we recycle the mailbox of the merge planner, this incarnation
-    /// makes it possible to ignore messages that where emitted from the previous
+    /// makes it possible to ignore messages that were emitted from the previous
     /// instantiation.
     incarnation_started_at: Instant,
+
+    /// E041: timestamp of the last `NewSplits` message, used to detect the quiet period
+    /// after ingest during which post-ingest compaction may run.
+    last_new_splits_at: Instant,
 }
 
 #[async_trait]
@@ -118,6 +131,10 @@ impl Actor for MergePlanner {
         let _ = ctx.try_send_self_message(PlanMerge {
             incarnation_started_at: self.incarnation_started_at,
         });
+
+        if self.merge_policy.post_ingest_compaction() {
+            ctx.schedule_self_msg(COMPACTION_TICK_INTERVAL, CompactionTick);
+        }
 
         Ok(())
     }
@@ -167,9 +184,48 @@ impl Handler<NewSplits> for MergePlanner {
         new_splits: NewSplits,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
+        self.last_new_splits_at = Instant::now();
         self.record_splits_if_necessary(new_splits.new_splits);
         self.send_merge_ops(false, ctx).await?;
         self.recompute_known_splits_if_necessary();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<CompactionTick> for MergePlanner {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _: CompactionTick,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        let quiet_enough = self.last_new_splits_at.elapsed() >= COMPACTION_QUIET_PERIOD;
+        let merges_idle = self.ongoing_merge_operations_inventory.list().is_empty();
+        if self.merge_policy.post_ingest_compaction() && quiet_enough && merges_idle {
+            let mut merge_operations = Vec::new();
+            for young_splits in self.partitioned_young_splits.values_mut() {
+                if !young_splits.is_empty() {
+                    merge_operations.extend(self.merge_policy.finalize_operations(young_splits));
+                }
+            }
+            self.partitioned_young_splits
+                .retain(|_, splits| !splits.is_empty());
+            for merge_operation in merge_operations {
+                debug!(merge_operation=?merge_operation, "schedule compaction merge operation");
+                let tracked_merge_operation = self
+                    .ongoing_merge_operations_inventory
+                    .track(merge_operation);
+                schedule_merge(
+                    &self.merge_scheduler_service,
+                    tracked_merge_operation,
+                    self.merge_split_downloader_mailbox.clone(),
+                )
+                .await?;
+            }
+        }
+        ctx.schedule_self_msg(COMPACTION_TICK_INTERVAL, CompactionTick);
         Ok(())
     }
 }
@@ -202,6 +258,7 @@ impl MergePlanner {
             ongoing_merge_operations_inventory: Inventory::default(),
 
             incarnation_started_at: Instant::now(),
+            last_new_splits_at: Instant::now(),
         };
         merge_planner.record_splits_if_necessary(immature_splits);
         merge_planner

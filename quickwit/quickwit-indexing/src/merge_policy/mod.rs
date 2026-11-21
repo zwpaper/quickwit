@@ -203,6 +203,13 @@ pub trait MergePolicy: Send + Sync + fmt::Debug {
         Vec::new()
     }
 
+    /// E041: returns true when the policy wants the merge planner to run periodic
+    /// post-ingest compaction (see `StableLogMergePolicy::post_ingest_compaction`).
+    /// Default `false` keeps the historical event-driven planner behaviour.
+    fn post_ingest_compaction(&self) -> bool {
+        false
+    }
+
     /// Returns split maturity.
     /// A split is either:
     /// - `Mature` if it does not undergo new merge operations.
