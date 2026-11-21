@@ -426,6 +426,7 @@ mod tests {
                 merge_factor: 3,
                 max_merge_factor: 5,
                 maturation_period: Duration::from_hours(1),
+                ..Default::default()
             },
             50_000,
         ));
