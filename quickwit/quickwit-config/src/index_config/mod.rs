@@ -122,6 +122,17 @@ pub struct IndexingSettings {
     pub merge_policy: MergePolicyConfig,
     #[serde(default)]
     pub resources: IndexingResources,
+    /// Maximum number of un-truncated document bytes a single indexing pipeline may
+    /// accumulate before it force-commits its open workbench. This bounds the ingest
+    /// backlog when the producer outruns the commit pipeline (whose flushes would
+    /// otherwise only happen every `commit_timeout_secs`).
+    ///
+    /// `0` (the default) disables the budget, preserving the historical behaviour for
+    /// single-pipeline deployments.
+    #[schema(value_type = String, default = "0 B")]
+    #[serde(default = "IndexingSettings::default_commit_max_ingest_backlog_bytes")]
+    #[serde(with = "crate::serde_utils::bytesize_serde")]
+    pub commit_max_ingest_backlog_bytes: ByteSize,
 }
 
 impl IndexingSettings {
@@ -145,6 +156,10 @@ impl IndexingSettings {
         10_000_000
     }
 
+    pub fn default_commit_max_ingest_backlog_bytes() -> ByteSize {
+        ByteSize::b(0)
+    }
+
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test() -> Self {
         Self {
@@ -163,6 +178,8 @@ impl Default for IndexingSettings {
             split_num_docs_target: Self::default_split_num_docs_target(),
             merge_policy: MergePolicyConfig::default(),
             resources: IndexingResources::default(),
+            commit_max_ingest_backlog_bytes:
+                Self::default_commit_max_ingest_backlog_bytes(),
         }
     }
 }

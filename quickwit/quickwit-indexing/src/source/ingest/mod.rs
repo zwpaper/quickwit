@@ -50,7 +50,7 @@ use super::{
     SourceRuntime, TypedSourceFactory,
 };
 use crate::actors::DocProcessor;
-use crate::metrics::IDLE_FORCE_COMMIT_TOTAL;
+use crate::metrics::{BACKLOG_FORCE_COMMIT_TOTAL, IDLE_FORCE_COMMIT_TOTAL};
 use crate::models::{LocalShardPositionsUpdate, NewPublishLock, PublishLock, SharedPublishToken};
 
 pub struct IngestSourceFactory;
@@ -154,6 +154,11 @@ pub struct IngestSource {
     /// Whether the idle force-commit was already emitted for the current idle episode (that is,
     /// since the last fetched payload), so it is emitted at most once per idle episode.
     idle_force_commit_sent: bool,
+    /// Byte budget of un-truncated document bytes above which the source force-commits the open
+    /// workbench. `0` disables the budget.
+    commit_max_ingest_backlog_bytes: u64,
+    /// Document bytes emitted to the pipeline since the last truncation ack (or budget flush).
+    bytes_since_truncate: u64,
 }
 
 impl fmt::Debug for IngestSource {
@@ -186,6 +191,10 @@ impl IngestSource {
         // indexing plan id carried by the assignment.
         let publish_lock = PublishLock::dead();
         let publish_token = source_runtime.publish_token.clone();
+        let commit_max_ingest_backlog_bytes = source_runtime
+            .indexing_setting
+            .commit_max_ingest_backlog_bytes
+            .as_u64();
 
         Ok(IngestSource {
             client_id,
@@ -198,6 +207,8 @@ impl IngestSource {
             event_broker: source_runtime.event_broker.clone(),
             empty_fetch_rounds: 0,
             idle_force_commit_sent: false,
+            commit_max_ingest_backlog_bytes,
+            bytes_since_truncate: 0,
         })
     }
 
@@ -449,6 +460,7 @@ impl IngestSource {
         );
         self.assigned_shards.clear();
         self.fetch_stream.reset();
+        self.bytes_since_truncate = 0;
         self.publish_lock.kill().await;
         self.publish_lock = PublishLock::default();
         ctx.send_message(
@@ -502,13 +514,32 @@ impl Source for IngestSource {
             ctx.record_progress();
         }
         if !batch_builder.checkpoint_delta.is_empty() {
+            let num_bytes = batch_builder.num_bytes;
             debug!(
                 num_docs=%batch_builder.docs.len(),
-                num_bytes=%batch_builder.num_bytes,
+                num_bytes=%num_bytes,
                 num_millis=%now.elapsed().as_millis(),
                 "Sending doc batch to indexer."
             );
             let message = batch_builder.build();
+            ctx.send_message(doc_processor_mailbox, message).await?;
+            self.bytes_since_truncate = self.bytes_since_truncate.saturating_add(num_bytes);
+        }
+        if self.commit_max_ingest_backlog_bytes > 0
+            && self.bytes_since_truncate >= self.commit_max_ingest_backlog_bytes
+        {
+            // The producer is outrunning the commit pipeline: flush the open workbench now
+            // instead of waiting out the remaining `commit_timeout`. The zero-doc batch carries
+            // an empty checkpoint delta and only sets `force_commit`.
+            self.bytes_since_truncate = 0;
+            BACKLOG_FORCE_COMMIT_TOTAL.inc();
+            debug!(
+                budget_bytes=%self.commit_max_ingest_backlog_bytes,
+                "Un-truncated byte budget reached: force-committing the open workbench."
+            );
+            let mut drain_batch = BatchBuilder::new(SourceType::IngestV2);
+            drain_batch.force_commit();
+            let message = drain_batch.build();
             ctx.send_message(doc_processor_mailbox, message).await?;
         }
         if saw_payload {
@@ -678,6 +709,9 @@ impl Source for IngestSource {
             })
             .collect();
         self.truncate(truncate_up_to_positions).await;
+        // The published-and-truncated positions ack tells us the pipeline drained up to here, so
+        // the un-truncated byte budget can start over.
+        self.bytes_since_truncate = 0;
         Ok(())
     }
 
@@ -904,6 +938,107 @@ mod tests {
             assert!(!doc_batch.force_commit);
         }
         assert!(doc_processor_inbox.drain_for_test().is_empty());
+    }
+
+    // A source that keeps producing must force-commit the open workbench exactly when its
+    // un-truncated byte budget is reached, and a `suggest_truncate` ack must reset the counter.
+    #[tokio::test]
+    async fn test_ingest_source_force_commits_at_backlog_budget() {
+        let mut source = for_test_ingest_source().await;
+        source
+            .assigned_shards
+            .insert(ShardId::from(1), for_test_assigned_shard());
+
+        let universe = Universe::with_accelerated_time();
+        let (source_mailbox, _source_inbox) = universe.create_test_mailbox::<SourceActor>();
+        let (doc_processor_mailbox, doc_processor_inbox) =
+            universe.create_test_mailbox::<DocProcessor>();
+        let (observable_state_tx, _observable_state_rx) = watch::channel(serde_json::Value::Null);
+        let ctx: SourceContext =
+            ActorContext::for_test(&universe, source_mailbox, observable_state_tx);
+        let fetch_message_tx = source.fetch_stream.fetch_message_tx();
+
+        let send_payload = |from_position: u64| {
+            let fetch_payload = FetchPayload {
+                index_uid: Some(IndexUid::for_test("test-index", 0)),
+                source_id: "test-source".into(),
+                shard_id: Some(ShardId::from(1)),
+                mrecord_batch: MRecordBatch::for_test(["\0\0test-doc"]),
+                from_position_exclusive: Some(Position::offset(from_position)),
+                to_position_inclusive: Some(Position::offset(from_position + 1)),
+            };
+            let batch_size = fetch_payload.estimate_size();
+            let fetch_message_tx = fetch_message_tx.clone();
+            async move {
+                fetch_message_tx
+                    .send(Ok(InFlightValue::new(
+                        FetchMessage::new_payload(fetch_payload),
+                        batch_size,
+                        &IN_FLIGHT_FETCH_STREAM,
+                    )))
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // With the budget disabled (default), a payload round forwards the docs and never
+        // force-commits, but the un-truncated byte counter still accumulates.
+        send_payload(10).await;
+        source
+            .emit_batches(&doc_processor_mailbox, &ctx)
+            .await
+            .unwrap();
+        let doc_batch = doc_processor_inbox
+            .recv_typed_message::<RawDocBatch>()
+            .await
+            .unwrap();
+        assert_eq!(doc_batch.docs.len(), 1);
+        assert!(!doc_batch.force_commit);
+        assert!(doc_processor_inbox.drain_for_test().is_empty());
+        let bytes_one_doc = source.bytes_since_truncate;
+        assert!(bytes_one_doc > 0);
+
+        // Set the budget to one batch: the next payload round flushes the open workbench with a
+        // zero-doc force-commit batch and resets the counter.
+        source.commit_max_ingest_backlog_bytes = bytes_one_doc;
+        source.bytes_since_truncate = 0;
+        send_payload(11).await;
+        source
+            .emit_batches(&doc_processor_mailbox, &ctx)
+            .await
+            .unwrap();
+        let doc_batch = doc_processor_inbox
+            .recv_typed_message::<RawDocBatch>()
+            .await
+            .unwrap();
+        assert_eq!(doc_batch.docs.len(), 1);
+        assert!(!doc_batch.force_commit);
+        let drain_batch = doc_processor_inbox
+            .recv_typed_message::<RawDocBatch>()
+            .await
+            .unwrap();
+        assert!(drain_batch.docs.is_empty());
+        assert!(drain_batch.force_commit);
+        assert!(drain_batch.checkpoint_delta.is_empty());
+        assert_eq!(source.bytes_since_truncate, 0);
+
+        // A `suggest_truncate` ack resets the counter even without a budget flush.
+        source.commit_max_ingest_backlog_bytes = u64::MAX;
+        send_payload(12).await;
+        source
+            .emit_batches(&doc_processor_mailbox, &ctx)
+            .await
+            .unwrap();
+        let _doc_batch = doc_processor_inbox
+            .recv_typed_message::<RawDocBatch>()
+            .await
+            .unwrap();
+        assert!(source.bytes_since_truncate > 0);
+        source
+            .suggest_truncate(SourceCheckpoint::default(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(source.bytes_since_truncate, 0);
     }
 
     // In this test, we simulate a source to which we sequentially assign the following set of
