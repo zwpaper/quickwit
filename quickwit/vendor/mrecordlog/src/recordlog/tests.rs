@@ -121,3 +121,53 @@ fn test_behavior_upon_corruption() {
         ));
     }
 }
+
+#[test]
+fn test_compressed_record_roundtrip() {
+    // A record above the compression threshold made of highly repetitive bytes: it must
+    // be stored compressed and decode back byte-for-byte. `write_record` returns the
+    // bytes pushed to the underlying writer (the in-memory writer zero-pads its buffer,
+    // so its `Vec` length is not the record size).
+    let record = "abcdefgh".repeat(20_000); // 160_000 bytes
+    let mut writer = RecordWriter::in_memory();
+    let num_bytes_written = writer.write_record(record.as_str()).unwrap();
+    writer.persist(PersistAction::Flush).unwrap();
+    assert!(
+        num_bytes_written as usize <= record.len() / 8,
+        "expected >=8x compression, got {} -> {}",
+        record.len(),
+        num_bytes_written
+    );
+    let buf: Vec<u8> = writer.into_writer().into();
+    let mut reader = RecordReader::open(ArrayReader::from(&buf[..]));
+    assert_eq!(reader.read_record::<&str>().unwrap(), Some(record.as_str()));
+    assert_eq!(reader.read_record::<&str>().unwrap(), None);
+}
+
+#[test]
+fn test_compressed_record_spans_multiple_frames() {
+    // ~4.4 MB of NDJSON shaped like the ingest payload: it still exceeds one 32 KiB
+    // frame once compressed, so the compressed record has to be split across several
+    // frames and reassembled.
+    let record: String = (0..20_000)
+        .map(|i| {
+            format!(
+                "{{\"timestamp\":{},\"severity_text\":\"INFO\",\"body\":\"request completed successfully\",\"attributes\":{{\"http.status_code\":200,\"http.method\":\"GET\"}},\"resource_attributes\":{{\"service.name\":\"frontend\",\"host.name\":\"host-{}\"}}}}\n",
+                1_758_585_600_000u64 + i,
+                i % 16
+            )
+        })
+        .collect();
+    let mut writer = RecordWriter::in_memory();
+    let num_bytes_written = writer.write_record(record.as_str()).unwrap();
+    writer.persist(PersistAction::Flush).unwrap();
+    assert!(
+        num_bytes_written as usize > BLOCK_NUM_BYTES,
+        "expected a multi-frame compressed record, got {num_bytes_written} bytes"
+    );
+    assert!(num_bytes_written as usize <= record.len() / 8);
+    let buf: Vec<u8> = writer.into_writer().into();
+    let mut reader = RecordReader::open(ArrayReader::from(&buf[..]));
+    assert_eq!(reader.read_record::<&str>().unwrap(), Some(record.as_str()));
+    assert_eq!(reader.read_record::<&str>().unwrap(), None);
+}

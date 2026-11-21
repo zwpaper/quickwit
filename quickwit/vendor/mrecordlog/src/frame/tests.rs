@@ -11,13 +11,13 @@ fn test_frame_simple() {
         let wrt: VecBlockWriter = VecBlockWriter::default();
         let mut frame_writer = FrameWriter::create(wrt);
         frame_writer
-            .write_frame(FrameType::First, &b"abc"[..])
+            .write_frame(FrameType::First, false, &b"abc"[..])
             .unwrap();
         frame_writer
-            .write_frame(FrameType::Middle, &b"de"[..])
+            .write_frame(FrameType::Middle, false, &b"de"[..])
             .unwrap();
         frame_writer
-            .write_frame(FrameType::Last, &b"fgh"[..])
+            .write_frame(FrameType::Last, false, &b"fgh"[..])
             .unwrap();
         frame_writer.persist(PersistAction::Flush).unwrap();
         frame_writer.into_writer()
@@ -25,14 +25,17 @@ fn test_frame_simple() {
     let buffer: Vec<u8> = block_writer.into();
     let mut frame_reader = FrameReader::open(ArrayReader::from(&buffer[..]));
     let read_frame_res = frame_reader.read_frame();
-    assert_eq!(read_frame_res.unwrap(), (FrameType::First, &b"abc"[..]));
     assert_eq!(
-        frame_reader.read_frame().unwrap(),
-        (FrameType::Middle, &b"de"[..])
+        read_frame_res.unwrap(),
+        (FrameType::First, false, &b"abc"[..])
     );
     assert_eq!(
         frame_reader.read_frame().unwrap(),
-        (FrameType::Last, &b"fgh"[..])
+        (FrameType::Middle, false, &b"de"[..])
+    );
+    assert_eq!(
+        frame_reader.read_frame().unwrap(),
+        (FrameType::Last, false, &b"fgh"[..])
     );
     assert!(matches!(
         frame_reader.read_frame().unwrap_err(),
@@ -44,9 +47,9 @@ fn test_frame_simple() {
 fn test_frame_corruption_in_payload() -> io::Result<()> {
     let mut buf: Vec<u8> = {
         let mut frame_writer = FrameWriter::create(VecBlockWriter::default());
-        frame_writer.write_frame(FrameType::First, &b"abc"[..])?;
+        frame_writer.write_frame(FrameType::First, false, &b"abc"[..])?;
         frame_writer.persist(PersistAction::Flush)?;
-        frame_writer.write_frame(FrameType::Middle, &b"de"[..])?;
+        frame_writer.write_frame(FrameType::Middle, false, &b"de"[..])?;
         frame_writer.persist(PersistAction::Flush)?;
         frame_writer.into_writer().into()
     };
@@ -58,7 +61,7 @@ fn test_frame_corruption_in_payload() -> io::Result<()> {
     ));
     assert!(matches!(
         frame_reader.read_frame(),
-        Ok((FrameType::Middle, b"de"))
+        Ok((FrameType::Middle, false, b"de"))
     ));
     Ok(())
 }
@@ -66,7 +69,9 @@ fn test_frame_corruption_in_payload() -> io::Result<()> {
 fn repeat_empty_frame_util(repeat: usize) -> Vec<u8> {
     let mut frame_writer = FrameWriter::create(VecBlockWriter::default());
     for _ in 0..repeat {
-        frame_writer.write_frame(FrameType::Full, &b""[..]).unwrap();
+        frame_writer
+            .write_frame(FrameType::Full, false, &b""[..])
+            .unwrap();
     }
     frame_writer.persist(PersistAction::Flush).unwrap();
     frame_writer.into_writer().into()
@@ -79,7 +84,7 @@ fn test_simple_multiple_blocks() -> io::Result<()> {
     let mut frame_reader = FrameReader::open(ArrayReader::from(&buffer[..]));
     for _ in 0..num_frames {
         let read_frame_res = frame_reader.read_frame();
-        assert!(matches!(read_frame_res, Ok((FrameType::Full, &[]))));
+        assert!(matches!(read_frame_res, Ok((FrameType::Full, false, &[]))));
     }
     assert!(matches!(
         frame_reader.read_frame(),
@@ -98,7 +103,7 @@ fn test_multiple_blocks_corruption_on_length() -> io::Result<()> {
     let mut frame_reader = FrameReader::open(ArrayReader::from(&buffer[..]));
     for _ in 0..2000 {
         let read_frame_res = frame_reader.read_frame();
-        assert!(matches!(read_frame_res, Ok((FrameType::Full, &[]))));
+        assert!(matches!(read_frame_res, Ok((FrameType::Full, false, &[]))));
     }
     assert!(matches!(
         frame_reader.read_frame(),
@@ -106,7 +111,7 @@ fn test_multiple_blocks_corruption_on_length() -> io::Result<()> {
     ));
     assert!(matches!(
         frame_reader.read_frame(),
-        Ok((FrameType::Full, &[]))
+        Ok((FrameType::Full, false, &[]))
     ));
     assert!(matches!(
         frame_reader.read_frame(),

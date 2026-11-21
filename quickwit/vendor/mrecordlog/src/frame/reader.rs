@@ -79,7 +79,7 @@ impl<R: BlockRead + Unpin> FrameReader<R> {
     }
 
     // Reads the next frame.
-    pub fn read_frame(&mut self) -> Result<(FrameType, &[u8]), ReadFrameError> {
+    pub fn read_frame(&mut self) -> Result<(FrameType, bool, &[u8]), ReadFrameError> {
         self.go_to_next_block_if_necessary()?;
         let header = self.get_frame_header()?;
         self.cursor += HEADER_LEN;
@@ -100,7 +100,11 @@ impl<R: BlockRead + Unpin> FrameReader<R> {
             // but the frame length was correct.
             return Err(ReadFrameError::Corruption);
         }
-        Ok((header.frame_type(), frame_payload))
+        Ok((
+            header.frame_type(),
+            header.is_compressed(),
+            frame_payload,
+        ))
     }
 }
 

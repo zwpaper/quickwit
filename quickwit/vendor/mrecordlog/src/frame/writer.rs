@@ -23,7 +23,12 @@ impl<W: BlockWrite + Unpin> FrameWriter<W> {
     ///
     /// Returns the number of bytes pushed to the underlying
     /// writer (header + payload, plus any zero-padding written to close out the current block).
-    pub fn write_frame(&mut self, frame_type: FrameType, payload: &[u8]) -> io::Result<usize> {
+    pub fn write_frame(
+        &mut self,
+        frame_type: FrameType,
+        compressed: bool,
+        payload: &[u8],
+    ) -> io::Result<usize> {
         let mut num_bytes_written = 0;
         let num_bytes_remaining_in_block = self.wrt.num_bytes_remaining_in_block();
 
@@ -36,7 +41,7 @@ impl<W: BlockWrite + Unpin> FrameWriter<W> {
         let record_len = HEADER_LEN + payload.len();
         let (buffer_header, buffer_record) = self.buffer[..record_len].split_at_mut(HEADER_LEN);
         buffer_record.copy_from_slice(payload);
-        Header::for_payload(frame_type, payload).serialize(buffer_header);
+        Header::for_payload(frame_type, compressed, payload).serialize(buffer_header);
         self.wrt.write(&self.buffer[..record_len])?;
 
         num_bytes_written += record_len;

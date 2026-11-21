@@ -9,6 +9,11 @@ use crate::{BlockRead, Serializable};
 pub struct RecordReader<R> {
     frame_reader: FrameReader<R>,
     record_buffer: Vec<u8>,
+    decompression_buffer: Vec<u8>,
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
+    // Whether the record currently being assembled is compressed. Taken from the first
+    // frame of the record; every frame of one record carries the same flag.
+    record_is_compressed: bool,
     // true if we are in the middle of reading a multifragment record.
     // This is useful, as it makes it possible to drop a record
     // if one of its fragment was corrupted.
@@ -21,6 +26,10 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
         RecordReader {
             frame_reader,
             record_buffer: Vec::with_capacity(10_000),
+            decompression_buffer: Vec::new(),
+            // If the context cannot be created, compressed records are reported as corrupt.
+            decompressor: zstd::bulk::Decompressor::new().ok(),
+            record_is_compressed: false,
             within_record: false,
         }
     }
@@ -53,15 +62,19 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
         loop {
             let frame = self.frame_reader.read_frame();
             match frame {
-                Ok((frame_type, frame_payload)) => {
+                Ok((frame_type, is_compressed, frame_payload)) => {
                     if frame_type.is_first_frame_of_record() {
                         self.within_record = true;
+                        self.record_is_compressed = is_compressed;
                         self.record_buffer.clear();
                     }
                     if self.within_record {
                         self.record_buffer.extend_from_slice(frame_payload);
                         if frame_type.is_last_frame_of_record() {
                             self.within_record = false;
+                            if self.record_is_compressed {
+                                self.decompress_record()?;
+                            }
                             return Ok(true);
                         }
                     }
@@ -79,6 +92,31 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
                 }
             }
         }
+    }
+
+    /// Replaces `record_buffer` (a compressed framing `[u32 uncompressed_len][zstd]`)
+    /// with the decompressed record payload so `record()` can deserialize it.
+    fn decompress_record(&mut self) -> Result<(), ReadRecordError> {
+        if self.record_buffer.len() < 4 {
+            return Err(ReadRecordError::Corruption);
+        }
+        let uncompressed_len =
+            u32::from_le_bytes(self.record_buffer[..4].try_into().unwrap()) as usize;
+        let Some(decompressor) = self.decompressor.as_mut() else {
+            return Err(ReadRecordError::Corruption);
+        };
+        let mut decompressed = std::mem::take(&mut self.decompression_buffer);
+        decompressed.clear();
+        decompressed.reserve(uncompressed_len);
+        let decompress_result =
+            decompressor.decompress_to_buffer(&self.record_buffer[4..], &mut decompressed);
+        if decompress_result.is_err() {
+            self.decompression_buffer = decompressed;
+            return Err(ReadRecordError::Corruption);
+        }
+        std::mem::swap(&mut self.record_buffer, &mut decompressed);
+        self.decompression_buffer = decompressed;
+        Ok(())
     }
 }
 

@@ -462,3 +462,33 @@ fn test_last_record() {
     let last_record = multi_record_log.last_record("queue1").unwrap();
     assert!(last_record.is_none());
 }
+
+#[test]
+fn test_compressed_batch_survives_reopen() {
+    // One batch appended as a single record (as the ingest path does), large enough to be
+    // compressed: after a fresh open the positions and payloads must be identical.
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| format!("{{\"doc\":{i},\"body\":\"a repeated log line body\"}}\n").into_bytes())
+        .collect();
+    {
+        let mut record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        record_log.create_queue("queue").unwrap();
+        record_log
+            .append_records(
+                "queue",
+                None,
+                payloads.iter().map(|payload| payload.as_slice()),
+            )
+            .unwrap();
+    }
+    {
+        let record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        let records: Vec<Record<'_>> = record_log.range("queue", ..).unwrap().collect();
+        assert_eq!(records.len(), payloads.len());
+        for (position, (record, payload)) in records.iter().zip(&payloads).enumerate() {
+            assert_eq!(record.position, position as u64);
+            assert_eq!(&record.payload[..], &payload[..]);
+        }
+    }
+}
