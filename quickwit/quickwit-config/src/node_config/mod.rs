@@ -722,6 +722,11 @@ pub struct IngestApiConfig {
     pub max_body_size: ByteSize,
     /// Maximum size of a request body after decompression.
     pub max_decompressed_body_size: ByteSize,
+    /// Whether the ingest WAL compresses records on disk. Disabled by default so the
+    /// default on-disk frame format is unchanged. WALs written with compression enabled
+    /// can only be opened by compression-aware binaries; see the mrecordlog README
+    /// "On-disk format & compatibility" section before enabling.
+    pub wal_compression_enabled: bool,
     /// (hidden) Targeted throughput for each shard
     pub shard_throughput_limit: ByteSize,
     /// (hidden) Maximum accumulated throughput capacity for underutilized
@@ -748,6 +753,7 @@ impl Default for IngestApiConfig {
             _replication_factor: None,
             max_body_size: ByteSize::mib(10),
             max_decompressed_body_size: ByteSize::mib(256),
+            wal_compression_enabled: false,
             shard_throughput_limit: DEFAULT_SHARD_THROUGHPUT_LIMIT,
             shard_burst_limit: DEFAULT_SHARD_BURST_LIMIT,
             shard_scale_up_factor: DEFAULT_SHARD_SCALE_UP_FACTOR,
@@ -1188,6 +1194,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ingest_api_config.max_body_size, ByteSize::mb(20));
+    }
+
+    #[test]
+    fn test_ingest_api_wal_compression_disabled_by_default() {
+        let default_config = IngestApiConfig::default();
+        assert!(!default_config.wal_compression_enabled);
+
+        // The default YAML (empty) also leaves it disabled.
+        let parsed_default: IngestApiConfig = serde_yaml::from_str("").unwrap();
+        assert!(!parsed_default.wal_compression_enabled);
+
+        // It can be opted in explicitly.
+        let enabled: IngestApiConfig =
+            serde_yaml::from_str("wal_compression_enabled: true").unwrap();
+        assert!(enabled.wal_compression_enabled);
     }
 
     #[test]

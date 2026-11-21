@@ -62,6 +62,44 @@ last record of a  of a file.
 
 There is no compaction logic.
 
+# On-disk format & compatibility
+
+A record is serialized and split into one or more frames. Each frame starts with a fixed
+7-byte header:
+
+```
+[ crc32(payload + type_byte):4 LE ][ payload_len:2 LE ][ type_byte:1 ]
+```
+
+`type_byte` is `FrameType as u8` in the low 7 bits (`Full = 1`, `First = 2`, `Middle = 3`,
+`Last = 4`, a strict whitelist) plus a high **compressed flag** (`0b1000_0000`). When the
+flag is set the frame payload is a zstd-compressed chunk of the record, prefixed by the
+record's uncompressed length as a `u32`. The flag is part of the CRC-covered type byte, so
+it cannot be flipped silently. Records written without compression have the flag clear and
+decode unchanged.
+
+Record compression is **opt-in**. `open_with_prefs` (and `open`) disable it; use
+`open_with_prefs_and_compression(path, policy, true)` to enable it. Reading is
+*unconditional*: a reader always accepts both compressed and uncompressed frames,
+regardless of how the writer was configured.
+
+Compatibility matrix:
+
+| reader \ writer | uncompressed frames | compressed frames |
+|---|---|---|
+| pre-compression binary | reads normally | `FrameType::from_u8` returns `None` → `Corruption`; the block is skipped during recovery (silent partial loss, no mis-decode) |
+| compression-aware binary | reads normally | reads normally |
+
+Because an old binary **cannot** read compressed frames, compression must never be enabled
+on a WAL that an older binary may still need to open. In particular, a new binary that has
+compressed a WAL must not be rolled back to a pre-compression binary without draining
+first:
+
+> **No-downgrade rule.** While `compression_enabled` is `true`, do not downgrade the node
+to a build that predates frame compression. Drain the WAL (truncate all queues and let the
+files be deleted) before downgrading, or keep compression disabled on WALs that may be
+opened by older binaries.
+
 # TODO
 
 - add backpressure.

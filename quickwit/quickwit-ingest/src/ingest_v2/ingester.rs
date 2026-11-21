@@ -169,6 +169,7 @@ impl Ingester {
         disk_capacity: ByteSize,
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
+        wal_compression_enabled: bool,
         idle_shard_timeout: Duration,
     ) -> IngestV2Result<Self> {
         let self_node_id: NodeId = cluster.self_node_id();
@@ -178,6 +179,7 @@ impl Ingester {
             disk_capacity,
             memory_capacity,
             rate_limiter_settings,
+            wal_compression_enabled,
         )
         .await;
 
@@ -1277,6 +1279,7 @@ mod tests {
                 self.disk_capacity,
                 self.memory_capacity,
                 self.rate_limiter_settings,
+                false,
                 self.idle_shard_timeout,
             )
             .await
@@ -1376,6 +1379,7 @@ mod tests {
                 ByteSize::mb(256),
                 ByteSize::mb(1),
                 RateLimiterSettings::default(),
+                false,
             )
             .await;
 

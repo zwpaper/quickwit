@@ -1172,6 +1172,7 @@ async fn setup_ingest_v2(
             node_config.ingest_api_config.max_queue_disk_usage,
             node_config.ingest_api_config.max_queue_memory_usage,
             rate_limiter_settings,
+            node_config.ingest_api_config.wal_compression_enabled,
             idle_shard_timeout,
         )
         .await?;

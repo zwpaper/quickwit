@@ -27,6 +27,10 @@ pub struct RecordWriter<W> {
     // `write_record` call so callers (the in-memory queue) can reuse the exact blob
     // written to disk without recompressing.
     last_record_is_compressed: bool,
+    /// Whether new records may be written compressed. Defaults to `true` so direct
+    /// users of this writer keep the historical behaviour; the WAL open path sets it
+    /// from the caller's policy. The reader is unaffected by this flag.
+    compression_enabled: bool,
 }
 
 fn frame_type(is_first_frame: bool, is_last_frame: bool) -> FrameType {
@@ -47,7 +51,17 @@ impl<W: BlockWrite + Unpin> From<FrameWriter<W>> for RecordWriter<W> {
             // If the context cannot be created, records are written uncompressed.
             compressor: zstd::bulk::Compressor::new(COMPRESSION_LEVEL).ok(),
             last_record_is_compressed: false,
+            compression_enabled: true,
         }
+    }
+}
+
+impl<W: BlockWrite + Unpin> RecordWriter<W> {
+    /// Enables or disables record compression for subsequent writes. Disabling it keeps
+    /// the on-disk format byte-identical to one written before compression existed; the
+    /// reader always decodes both compressed and uncompressed frames.
+    pub fn set_compression_enabled(&mut self, compression_enabled: bool) {
+        self.compression_enabled = compression_enabled;
     }
 }
 
@@ -103,6 +117,9 @@ impl<W: BlockWrite + Unpin> RecordWriter<W> {
     /// record is large enough and compression actually shrinks it. Returns whether the
     /// buffer now holds a compressed record.
     fn compress_buffer_if_worthwhile(&mut self) -> bool {
+        if !self.compression_enabled {
+            return false;
+        }
         let uncompressed_len = self.buffer.len();
         if uncompressed_len < COMPRESSION_MIN_BYTES || uncompressed_len > u32::MAX as usize {
             return false;

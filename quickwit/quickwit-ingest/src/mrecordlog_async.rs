@@ -62,19 +62,35 @@ impl MultiRecordLogAsync {
         mrecordlog
     }
 
-    /// Opens the WAL with the [`DEFAULT_WAL_PERSIST_POLICY`].
+    /// Opens the WAL with the [`DEFAULT_WAL_PERSIST_POLICY`] and compression disabled.
     pub async fn open(directory_path: &Path) -> Result<Self, ReadRecordError> {
         Self::open_with_prefs(directory_path, DEFAULT_WAL_PERSIST_POLICY).await
     }
 
+    /// Opens the WAL with the given persist policy and compression disabled.
     #[instrument(name = "mrecordlog.open_async", skip_all, fields(directory_path = %directory_path.display(), ?persist_policy))]
     pub async fn open_with_prefs(
         directory_path: &Path,
         persist_policy: PersistPolicy,
     ) -> Result<Self, ReadRecordError> {
+        Self::open_with_prefs_and_compression(directory_path, persist_policy, false).await
+    }
+
+    /// Opens the WAL with the given persist policy and an explicit compression policy.
+    /// Reading is unconditional: compressed WALs open regardless of this flag.
+    #[instrument(name = "mrecordlog.open_async", skip_all, fields(directory_path = %directory_path.display(), ?persist_policy, compression_enabled))]
+    pub async fn open_with_prefs_and_compression(
+        directory_path: &Path,
+        persist_policy: PersistPolicy,
+        compression_enabled: bool,
+    ) -> Result<Self, ReadRecordError> {
         let directory_path = directory_path.to_path_buf();
         let mrecordlog = tokio::task::spawn(async move {
-            MultiRecordLog::open_with_prefs(&directory_path, persist_policy)
+            MultiRecordLog::open_with_prefs_and_compression(
+                &directory_path,
+                persist_policy,
+                compression_enabled,
+            )
         })
         .await
         .map_err(|join_err| {
