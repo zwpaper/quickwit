@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::collections::hash_map::Entry;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::NonZeroU32;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -67,6 +69,20 @@ struct CommitTimeout {
     workbench_id: Ulid,
 }
 
+/// Deterministic per-pipeline phase in `[0, commit_timeout)` derived from the pipeline id.
+///
+/// Pipelines are spawned together and receive their first batch within a second of each other, so
+/// arming every first `CommitTimeout` with the full `commit_timeout` makes all workbenches commit
+/// (and their splits finalize) at the same wall instant. Offsetting the first deadline by a
+/// per-pipeline phase spreads those commits across the `commit_timeout` window. It reuses the
+/// phase construction of cooperative indexing (`cooperative_indexing.rs`), but is applied
+/// unconditionally and without its semaphore/pause.
+fn commit_phase(pipeline_id: &IndexingPipelineId, commit_timeout: Duration) -> Duration {
+    let mut hasher = DefaultHasher::new();
+    pipeline_id.hash(&mut hasher);
+    Duration::from_millis(hasher.finish() % commit_timeout.as_millis().max(1) as u64)
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct IndexerCounters {
     /// Number of splits that were emitted by the indexer.
@@ -102,6 +118,10 @@ struct IndexerState {
     index_settings: IndexSettings,
     cooperative_indexing_opt: Option<CooperativeIndexingCycle>,
     indexing_io_throughput_limiter_opt: Option<Limiter>,
+    /// Offset applied to the first workbench's `CommitTimeout` deadline (see [`commit_phase`]).
+    /// `None` when cooperative indexing is enabled: it already de-synchronizes pipelines, so an
+    /// additional offset would fight its own phase steering.
+    commit_phase_opt: Option<Duration>,
 }
 
 impl IndexerState {
@@ -254,6 +274,7 @@ impl IndexerState {
     async fn get_or_create_workbench<'a>(
         &'a self,
         indexing_workbench_opt: &'a mut Option<IndexingWorkbench>,
+        is_first_workbench: bool,
         ctx: &'a ActorContext<Indexer>,
     ) -> anyhow::Result<&'a mut IndexingWorkbench> {
         if indexing_workbench_opt.is_none() {
@@ -261,10 +282,15 @@ impl IndexerState {
             let commit_timeout_message = CommitTimeout {
                 workbench_id: indexing_workbench.workbench_id,
             };
-            ctx.schedule_self_msg(
-                self.indexing_settings.commit_timeout(),
-                commit_timeout_message,
-            );
+            // The first workbench of a pipeline is offset by its deterministic phase; later
+            // workbenches are created right after the previous commit and keep that phase.
+            let commit_timeout = if is_first_workbench {
+                self.commit_phase_opt
+                    .unwrap_or_else(|| self.indexing_settings.commit_timeout())
+            } else {
+                self.indexing_settings.commit_timeout()
+            };
+            ctx.schedule_self_msg(commit_timeout, commit_timeout_message);
             *indexing_workbench_opt = Some(indexing_workbench);
         }
         let current_indexing_workbench = indexing_workbench_opt.as_mut().context(
@@ -276,6 +302,7 @@ impl IndexerState {
     async fn index_batch(
         &self,
         batch: ProcessedDocBatch,
+        is_first_workbench: bool,
         indexing_workbench_opt: &mut Option<IndexingWorkbench>,
         counters: &mut IndexerCounters,
         ctx: &ActorContext<Indexer>,
@@ -289,7 +316,7 @@ impl IndexerState {
             memory_usage,
             ..
         } = self
-            .get_or_create_workbench(indexing_workbench_opt, ctx)
+            .get_or_create_workbench(indexing_workbench_opt, is_first_workbench, ctx)
             .await?;
         if publish_lock.is_dead() {
             // Release indexing permit early.
@@ -559,6 +586,11 @@ impl Indexer {
                     cooperative_indexing_permits,
                 )
             });
+        let commit_phase_opt = if cooperative_indexing_opt.is_some() {
+            None
+        } else {
+            Some(commit_phase(&pipeline_id, indexing_settings.commit_timeout()))
+        };
         Self {
             indexer_state: IndexerState {
                 pipeline_id,
@@ -574,6 +606,7 @@ impl Indexer {
                 max_num_partitions: doc_mapper.max_num_partitions(),
                 cooperative_indexing_opt,
                 indexing_io_throughput_limiter_opt,
+                commit_phase_opt,
             },
             index_serializer_mailbox,
             indexing_workbench_opt: None,
@@ -596,9 +629,13 @@ impl Indexer {
     ) -> Result<(), ActorExitStatus> {
         fail_point!("indexer:batch:before");
         let force_commit = batch.force_commit;
+        // The commit-phase offset applies to the pipeline's first workbench only: later workbenches
+        // are created right after a commit, which already carries the phase.
+        let is_first_workbench = self.counters.num_split_batches_emitted == 0;
         self.indexer_state
             .index_batch(
                 batch,
+                is_first_workbench,
                 &mut self.indexing_workbench_opt,
                 &mut self.counters,
                 ctx,
@@ -1828,6 +1865,104 @@ mod tests {
             IndexCheckpointDelta::for_test("test-source", 4..8)
         );
 
+        universe.assert_quit().await;
+        Ok(())
+    }
+
+    fn test_pipeline_id(ordinal: u128) -> IndexingPipelineId {
+        IndexingPipelineId {
+            index_uid: IndexUid::for_test("test-index", 1),
+            source_id: format!("test-source-{ordinal}"),
+            node_id: NodeId::from_str("test-node"),
+            pipeline_uid: PipelineUid::for_test(ordinal + 1),
+        }
+    }
+
+    #[test]
+    fn test_commit_phase_is_deterministic_and_spread() {
+        let commit_timeout = Duration::from_secs(30);
+        let phases: Vec<Duration> = (0..17)
+            .map(|ordinal| {
+                let pipeline_id = test_pipeline_id(ordinal);
+                let phase = commit_phase(&pipeline_id, commit_timeout);
+                assert!(phase < commit_timeout);
+                // The phase is a pure function of the pipeline id.
+                assert_eq!(phase, commit_phase(&pipeline_id, commit_timeout));
+                phase
+            })
+            .collect();
+        let min = *phases.iter().min().unwrap();
+        let max = *phases.iter().max().unwrap();
+        assert!(
+            max - min >= commit_timeout / 2,
+            "commit phases are not spread over the commit timeout: min={min:?} max={max:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_indexer_first_commit_timeout_is_phase_offset() -> anyhow::Result<()> {
+        let commit_timeout = Duration::from_secs(10);
+        // Deterministically pick a pipeline whose phase is well below the commit timeout, so that
+        // a commit observed after only half the timeout can only come from the phase offset.
+        let pipeline_id = (0..10_000u128)
+            .map(test_pipeline_id)
+            .find(|pipeline_id| commit_phase(pipeline_id, commit_timeout) < commit_timeout / 2)
+            .expect("no pipeline id with a small enough commit phase");
+        let expected_phase = commit_phase(&pipeline_id, commit_timeout);
+        assert!(expected_phase < commit_timeout / 2);
+
+        let doc_mapper = Arc::new(default_doc_mapper_for_test());
+        let schema = doc_mapper.schema();
+        let body_field = schema.get_field("body").unwrap();
+        let timestamp_field = schema.get_field("timestamp").unwrap();
+        let indexing_directory = TempDirectory::for_test();
+        let mut indexing_settings = IndexingSettings::for_test();
+        indexing_settings.commit_timeout_secs = commit_timeout.as_secs() as usize;
+        let universe = Universe::with_accelerated_time();
+        let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_last_delete_opstamp()
+            .returning(move |_last_delete_opstamp_request| {
+                Ok(LastDeleteOpstampResponse::new(0))
+            });
+        let indexer = create_indexer_for_test(
+            pipeline_id,
+            doc_mapper,
+            MetastoreServiceClient::from_mock(mock_metastore),
+            indexing_directory,
+            indexing_settings,
+            None,
+            index_serializer_mailbox,
+            None,
+        );
+        let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
+        indexer_mailbox
+            .send_message(ProcessedDocBatch::new(
+                vec![ProcessedDoc {
+                    doc: doc!(
+                        body_field=>"this is a test document",
+                        timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
+                    ),
+                    fingerprint_opt: None,
+                    timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
+                    partition: 1,
+                    num_bytes: 30,
+                }],
+                SourceCheckpointDelta::from_range(0..1),
+                false,
+            ))
+            .await?;
+        // Half the commit timeout is strictly more than this pipeline's phase: with the offset the
+        // first commit has fired, whereas with the historical full `commit_timeout` deadline it
+        // would still be pending.
+        universe.sleep(commit_timeout / 2).await;
+        let indexer_counters = indexer_handle.process_pending_and_observe().await.state;
+        assert_eq!(indexer_counters.num_split_batches_emitted, 1);
+        let messages: Vec<IndexedSplitBatchBuilder> = index_serializer_inbox.drain_for_test_typed();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].commit_trigger, CommitTrigger::Timeout);
+        assert_eq!(messages[0].splits[0].split_attrs.num_docs, 1);
         universe.assert_quit().await;
         Ok(())
     }
