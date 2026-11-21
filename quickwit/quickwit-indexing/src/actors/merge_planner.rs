@@ -13,14 +13,15 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
+use quickwit_common::pubsub::{EventBroker, EventSubscriptionHandle};
 use quickwit_metastore::{SplitMaturity, SplitMetadata};
 use quickwit_proto::indexing::MergePipelineId;
-use quickwit_proto::types::{DocMappingUid, SplitId};
+use quickwit_proto::types::{DocMappingUid, SourceUid, SplitId};
 use tantivy::Inventory;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
@@ -29,7 +30,7 @@ use super::merge_scheduler_service::schedule_merge;
 use super::{MergeSchedulerService, MergeSplitDownloader};
 use crate::MergePolicy;
 use crate::merge_policy::MergeOperation;
-use crate::models::NewSplits;
+use crate::models::{IngestSourceIdle, NewSplits};
 
 #[derive(Debug)]
 pub(crate) struct RunFinalizeMergePolicyAndQuit;
@@ -40,8 +41,14 @@ struct CompactionTick;
 
 /// How often the planner checks whether the compaction pass can run.
 const COMPACTION_TICK_INTERVAL: Duration = Duration::from_secs(5);
-/// Minimum quiet period (no new split published, no ongoing merge) before compaction runs.
-const COMPACTION_QUIET_PERIOD: Duration = Duration::from_secs(10);
+/// Minimum source-idle and publication-quiet period before post-ingest compaction runs.
+///
+/// This is deliberately much longer than the old 10 s heuristic: a mid-ingest publication gap
+/// (the indexer/merger being busy) can easily last 10 s, whereas a *source* that is genuinely
+/// idle for this long has stopped receiving documents. Combined with the
+/// [`IngestSourceIdle`] event and `ongoing_merges == 0`, compaction can no longer start while
+/// the ingest path is still working.
+const COMPACTION_QUIET_PERIOD: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MergePartition {
@@ -103,6 +110,20 @@ pub struct MergePlanner {
     /// E041: timestamp of the last `NewSplits` message, used to detect the quiet period
     /// after ingest during which post-ingest compaction may run.
     last_new_splits_at: Instant,
+
+    /// E041: source uid this merge pipeline belongs to, used to filter [`IngestSourceIdle`]
+    /// events published by the indexing pipelines of the same source.
+    source_uid: SourceUid,
+
+    /// E041: event broker used to subscribe to [`IngestSourceIdle`] when compaction is enabled.
+    event_broker: EventBroker,
+
+    /// E041: start of the last observed source-idle episode, shared with the event-broker
+    /// callback. `None` until the source has been seen idle at least once.
+    last_source_idle_at: Arc<Mutex<Option<Instant>>>,
+
+    /// E041: keeps the source-idle subscription alive for the lifetime of this planner.
+    event_subscription_handle_opt: Option<EventSubscriptionHandle>,
 }
 
 #[async_trait]
@@ -133,6 +154,7 @@ impl Actor for MergePlanner {
         });
 
         if self.merge_policy.post_ingest_compaction() {
+            self.subscribe_to_source_idle();
             ctx.schedule_self_msg(COMPACTION_TICK_INTERVAL, CompactionTick);
         }
 
@@ -202,8 +224,17 @@ impl Handler<CompactionTick> for MergePlanner {
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
         let quiet_enough = self.last_new_splits_at.elapsed() >= COMPACTION_QUIET_PERIOD;
+        let source_idle_enough = self
+            .last_source_idle_at
+            .lock()
+            .expect("mutex poisoned")
+            .is_some_and(|idle_at| idle_at.elapsed() >= COMPACTION_QUIET_PERIOD);
         let merges_idle = self.ongoing_merge_operations_inventory.list().is_empty();
-        if self.merge_policy.post_ingest_compaction() && quiet_enough && merges_idle {
+        if self.merge_policy.post_ingest_compaction()
+            && quiet_enough
+            && source_idle_enough
+            && merges_idle
+        {
             let mut merge_operations = Vec::new();
             for young_splits in self.partitioned_young_splits.values_mut() {
                 if !young_splits.is_empty() {
@@ -243,11 +274,16 @@ impl MergePlanner {
         merge_policy: Arc<dyn MergePolicy>,
         merge_split_downloader_mailbox: Mailbox<MergeSplitDownloader>,
         merge_scheduler_service: Mailbox<MergeSchedulerService>,
+        event_broker: EventBroker,
     ) -> MergePlanner {
         let immature_splits: Vec<SplitMetadata> = immature_splits
             .into_iter()
             .filter(|split_metadata| belongs_to_pipeline(pipeline_id, split_metadata))
             .collect();
+        let source_uid = SourceUid {
+            index_uid: pipeline_id.index_uid.clone(),
+            source_id: pipeline_id.source_id.clone(),
+        };
         let mut merge_planner = MergePlanner {
             known_split_ids: Default::default(),
             known_split_ids_recompute_attempt_id: 0,
@@ -259,9 +295,29 @@ impl MergePlanner {
 
             incarnation_started_at: Instant::now(),
             last_new_splits_at: Instant::now(),
+
+            source_uid,
+            event_broker,
+            last_source_idle_at: Arc::new(Mutex::new(None)),
+            event_subscription_handle_opt: None,
         };
         merge_planner.record_splits_if_necessary(immature_splits);
         merge_planner
+    }
+
+    /// E041: subscribes to the local [`IngestSourceIdle`] events of this merge pipeline's source.
+    /// The callback only records the idle timestamp in shared state; the planner polls it on its
+    /// tick, so a (possibly busy) publisher thread never blocks and no mailbox capacity is
+    /// consumed.
+    fn subscribe_to_source_idle(&mut self) {
+        let source_uid = self.source_uid.clone();
+        let last_source_idle_at = self.last_source_idle_at.clone();
+        let handle = self.event_broker.subscribe(move |event: IngestSourceIdle| {
+            if event.source_uid == source_uid {
+                *last_source_idle_at.lock().expect("mutex poisoned") = Some(Instant::now());
+            }
+        });
+        self.event_subscription_handle_opt = Some(handle);
     }
 
     fn rebuild_known_split_ids(&self) -> HashSet<SplitId> {
@@ -436,6 +492,7 @@ mod tests {
         MergePolicy, MergeSource, StableLogMergePolicy, merge_policy_from_settings,
     };
     use crate::models::NewSplits;
+    use quickwit_common::pubsub::EventBroker;
 
     fn split_metadata_for_test(
         index_uid: &IndexUid,
@@ -497,6 +554,7 @@ mod tests {
             merge_policy,
             merge_split_downloader_mailbox,
             universe.get_or_spawn_one(),
+            EventBroker::default(),
         );
         let (merge_planner_mailbox, merge_planner_handle) =
             universe.spawn_builder().spawn(merge_planner);
@@ -635,6 +693,7 @@ mod tests {
             merge_policy,
             merge_split_downloader_mailbox,
             universe.get_or_spawn_one(),
+            EventBroker::default(),
         );
         let (merge_planner_mailbox, merge_planner_handle) =
             universe.spawn_builder().spawn(merge_planner);
@@ -727,6 +786,7 @@ mod tests {
             merge_policy,
             merge_split_downloader_mailbox,
             universe.get_or_spawn_one(),
+            EventBroker::default(),
         );
         let (merge_planner_mailbox, merge_planner_handle) =
             universe.spawn_builder().spawn(merge_planner);
@@ -792,6 +852,7 @@ mod tests {
             merge_policy,
             merge_split_downloader_mailbox,
             universe.get_or_spawn_one(),
+            EventBroker::default(),
         );
         // We create a fake old mailbox that contains two new splits and a PlanMerge message from an
         // old incarnation. This could happen in real life if the merge pipeline failed

@@ -494,6 +494,7 @@ pub mod tests {
             merge_policy.clone(),
             merge_task_mailbox,
             universe.get_or_spawn_one::<MergeSchedulerService>(),
+            quickwit_common::pubsub::EventBroker::default(),
         );
         let mut split_index: HashMap<String, SplitMetadata> = HashMap::default();
         let (merge_planner_mailbox, merge_planner_handler) =
