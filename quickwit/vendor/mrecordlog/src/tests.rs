@@ -492,3 +492,69 @@ fn test_compressed_batch_survives_reopen() {
         }
     }
 }
+
+#[test]
+fn test_inmemory_compressed_batch_is_smaller_than_plaintext() {
+    // A batch large enough to be compressed must be stored compressed in the in-memory
+    // queue, not as plaintext.
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            let pad = "lorem ipsum dolor sit amet ".repeat(20);
+            format!("{{\"doc\":{i},\"body\":\"{pad}\"}}\n").into_bytes()
+        })
+        .collect();
+    let total_plain: usize = payloads.iter().map(|payload| payload.len()).sum();
+    let mut record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records(
+            "queue",
+            None,
+            payloads.iter().map(|payload| payload.as_slice()),
+        )
+        .unwrap();
+    let usage = record_log.resource_usage();
+    assert!(
+        usage.memory_used_bytes < total_plain / 2,
+        "in-memory queue used {} bytes for {} plaintext bytes",
+        usage.memory_used_bytes,
+        total_plain
+    );
+}
+
+#[test]
+fn test_compressed_batch_mid_truncate_and_reopen() {
+    // Truncating in the middle of a single compressed in-memory batch keeps the tail
+    // byte-identical, and reopening replays the same surviving records.
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| format!("{{\"doc\":{i},\"body\":\"a repeated log line body\"}}\n").into_bytes())
+        .collect();
+    {
+        let mut record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        record_log.create_queue("queue").unwrap();
+        record_log
+            .append_records(
+                "queue",
+                None,
+                payloads.iter().map(|payload| payload.as_slice()),
+            )
+            .unwrap();
+        let evicted = record_log.truncate("queue", ..=499).unwrap().evicted_records;
+        assert_eq!(evicted, 500);
+        let records: Vec<Record<'_>> = record_log.range("queue", ..).unwrap().collect();
+        assert_eq!(records.len(), 1_500);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.position, (i + 500) as u64);
+            assert_eq!(&record.payload[..], &payloads[i + 500][..]);
+        }
+    }
+    {
+        let record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        let records: Vec<Record<'_>> = record_log.range("queue", ..).unwrap().collect();
+        assert_eq!(records.len(), 1_500);
+        assert_eq!(&records[0].payload[..], &payloads[500][..]);
+        assert_eq!(&records[1_499].payload[..], &payloads[1_999][..]);
+    }
+}

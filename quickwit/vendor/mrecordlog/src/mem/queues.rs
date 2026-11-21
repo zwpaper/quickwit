@@ -93,6 +93,31 @@ impl MemQueues {
             .append_record(file_number, target_position, payload)
     }
 
+    /// Appends a batch of records already serialized (and possibly compressed) by the
+    /// record writer. See [`MemQueue::append_batch`].
+    pub fn append_batch(
+        &mut self,
+        queue: &str,
+        file_number: &FileNumber,
+        blob: Vec<u8>,
+        is_compressed: bool,
+        records: impl Iterator<Item = (u64, usize, usize)>,
+    ) -> Result<(), AppendError> {
+        self.get_queue_mut(queue)?
+            .append_batch(file_number, blob, is_compressed, records)
+    }
+
+    /// Appends a contiguous plaintext batch of records (recovery path).
+    pub fn append_plain_records<'a>(
+        &mut self,
+        queue: &str,
+        file_number: &FileNumber,
+        payloads: impl Iterator<Item = (u64, &'a [u8])>,
+    ) -> Result<(), AppendError> {
+        self.get_queue_mut(queue)?
+            .append_plain_records(file_number, payloads)
+    }
+
     pub fn contains_queue(&self, queue: &str) -> bool {
         self.queues.contains_key(queue)
     }

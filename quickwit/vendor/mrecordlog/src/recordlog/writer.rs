@@ -23,6 +23,10 @@ pub struct RecordWriter<W> {
     buffer: Vec<u8>,
     compression_buffer: Vec<u8>,
     compressor: Option<zstd::bulk::Compressor<'static>>,
+    // Whether the record currently held in `buffer` is compressed. Set by the last
+    // `write_record` call so callers (the in-memory queue) can reuse the exact blob
+    // written to disk without recompressing.
+    last_record_is_compressed: bool,
 }
 
 fn frame_type(is_first_frame: bool, is_last_frame: bool) -> FrameType {
@@ -42,6 +46,7 @@ impl<W: BlockWrite + Unpin> From<FrameWriter<W>> for RecordWriter<W> {
             compression_buffer: Vec::new(),
             // If the context cannot be created, records are written uncompressed.
             compressor: zstd::bulk::Compressor::new(COMPRESSION_LEVEL).ok(),
+            last_record_is_compressed: false,
         }
     }
 }
@@ -70,6 +75,7 @@ impl<W: BlockWrite + Unpin> RecordWriter<W> {
         self.buffer.clear();
         record.serialize(&mut self.buffer);
         let compressed = self.compress_buffer_if_worthwhile();
+        self.last_record_is_compressed = compressed;
         let mut payload = &self.buffer[..];
 
         loop {
@@ -121,6 +127,14 @@ impl<W: BlockWrite + Unpin> RecordWriter<W> {
         self.buffer.extend_from_slice(&compressed);
         self.compression_buffer = compressed;
         true
+    }
+
+    /// Returns the bytes of the record produced by the last [`Self::write_record`] call
+    /// (exactly what was framed to disk), together with whether they are compressed.
+    /// The returned slice is valid until the next write. This lets the in-memory queue
+    /// store the already-computed compressed blob instead of recompressing.
+    pub fn last_written_blob(&self) -> (&[u8], bool) {
+        (&self.buffer, self.last_record_is_compressed)
     }
 
     /// Persist the data to disk, according to the persist_action.

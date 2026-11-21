@@ -101,6 +101,13 @@ impl TryFrom<u8> for RecordType {
     }
 }
 
+/// Byte length of the serialized `MultiPlexedRecord` header that precedes the
+/// `MultiRecord` payload region: record type `u8` + position `u64` + queue len `u16`.
+pub(crate) const MULTIPLEXED_RECORD_HEADER_LEN: usize = 11;
+
+/// Byte length of each `MultiRecord` entry header: position `u64` + len `u32`.
+pub(crate) const MULTIRECORD_ENTRY_HEADER_LEN: usize = 12;
+
 fn serialize(
     record_type: RecordType,
     position: u64,
