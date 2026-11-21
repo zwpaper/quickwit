@@ -222,6 +222,9 @@ impl From<ReadRecordError> for IngestServiceError {
             ReadRecordError::Corruption => {
                 IngestServiceError::Corruption("failed to read record".to_string())
             }
+            ReadRecordError::CompressionUnsupported => IngestServiceError::Corruption(
+                "WAL uses compressed frames, but this reader cannot decode them".to_string(),
+            ),
         }
     }
 }

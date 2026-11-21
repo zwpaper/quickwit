@@ -8,7 +8,7 @@ use tracing::{debug, event_enabled, info, warn, Level};
 use crate::error::{
     AppendError, CreateQueueError, DeleteQueueError, MissingQueue, ReadRecordError, TruncateError,
 };
-use crate::mem::{MemQueue, QueuesSummary};
+use crate::mem::{MemQueue, QueuesSummary, RecordLocation};
 use crate::record::{
     MultiPlexedRecord, MultiRecord, MULTIPLEXED_RECORD_HEADER_LEN, MULTIRECORD_ENTRY_HEADER_LEN,
 };
@@ -25,6 +25,55 @@ pub struct MultiRecordLog {
     next_persist: PersistState,
     // A simple buffer we reuse to avoid allocation.
     multi_record_spare_buffer: Vec<u8>,
+}
+
+/// Filename of the directory-level compression format marker. It deliberately does not
+/// match the `wal-<20 digits>` WAL file pattern, so [`crate::rolling::Directory`] ignores
+/// it and it never counts as WAL data.
+const COMPRESSION_FORMAT_MARKER_FILENAME: &str = "wal-format-compression-v1";
+
+/// Reserved queue name for the compression format sentinel record. It starts with a NUL
+/// so it cannot collide with a user queue name.
+const COMPRESSION_FORMAT_SENTINEL_QUEUE: &str = "\0mrecordlog-format-compression-v1";
+
+pub(crate) fn compression_format_marker_path(directory_path: &Path) -> std::path::PathBuf {
+    directory_path.join(COMPRESSION_FORMAT_MARKER_FILENAME)
+}
+
+/// Returns whether the WAL directory carries the compression format marker, i.e. was
+/// written by a compression-aware writer and may therefore contain compressed frames.
+pub(crate) fn has_compression_format_marker(directory_path: &Path) -> bool {
+    compression_format_marker_path(directory_path).exists()
+}
+
+fn create_compression_format_marker(directory_path: &Path) -> io::Result<()> {
+    std::fs::write(compression_format_marker_path(directory_path), b"compressed\n")
+}
+
+/// Writes the compression format sentinel as a record in the WAL.
+///
+/// The sentinel is a structurally valid `AppendRecords` record whose declared queue
+/// position (`1`) is ahead of its single record position (`0`). Every decoder can parse
+/// the frame, but the pre-E020 recovery path acks position `1` and then tries to append a
+/// record at position `0`, which is in the past. It maps that to
+/// [`ReadRecordError::Corruption`] and fails `open` **loudly**, instead of silently
+/// recovering only the uncompressed prefix and dropping the compressed suffix.
+/// Compression-aware readers recognise the reserved queue and skip it.
+fn write_compression_format_sentinel(
+    record_log_writer: &mut RecordWriter<RollingWriter>,
+) -> io::Result<()> {
+    let mut record_entries = Vec::with_capacity(MULTIRECORD_ENTRY_HEADER_LEN);
+    record_entries.extend_from_slice(&0u64.to_le_bytes());
+    record_entries.extend_from_slice(&0u32.to_le_bytes());
+    let records = MultiRecord::new_unchecked(&record_entries);
+    let sentinel = MultiPlexedRecord::AppendRecords {
+        queue: COMPRESSION_FORMAT_SENTINEL_QUEUE,
+        position: 1,
+        records,
+    };
+    record_log_writer.write_record(sentinel)?;
+    record_log_writer.persist(PersistAction::Flush)?;
+    Ok(())
 }
 
 impl MultiRecordLog {
@@ -59,11 +108,37 @@ impl MultiRecordLog {
     /// whether the writer compresses newly appended records. Reading is unconditional:
     /// a log containing compressed frames opens regardless of `compression_enabled`, so
     /// enabling it is not a per-node requirement and disabling it does not hide data.
+    ///
+    /// This path declares that the reader can decode compressed frames. Use
+    /// [`Self::open_with_prefs_and_compression_capability`] to declare otherwise.
     pub fn open_with_prefs_and_compression(
         directory_path: &Path,
         persist_policy: PersistPolicy,
         compression_enabled: bool,
     ) -> Result<Self, ReadRecordError> {
+        Self::open_with_prefs_and_compression_capability(
+            directory_path,
+            persist_policy,
+            compression_enabled,
+            true,
+        )
+    }
+
+    /// Open the multi record log, declaring whether this reader can decode compressed
+    /// frames. Reading compressed frames is otherwise unconditional.
+    ///
+    /// If the WAL carries the compression format marker and `reader_can_decode_compressed`
+    /// is `false`, opening is refused with [`ReadRecordError::CompressionUnsupported`]
+    /// rather than silently recovering only the uncompressed prefix.
+    pub fn open_with_prefs_and_compression_capability(
+        directory_path: &Path,
+        persist_policy: PersistPolicy,
+        compression_enabled: bool,
+        reader_can_decode_compressed: bool,
+    ) -> Result<Self, ReadRecordError> {
+        if !reader_can_decode_compressed && has_compression_format_marker(directory_path) {
+            return Err(ReadRecordError::CompressionUnsupported);
+        }
         // io errors are non-recoverable
         let rolling_reader = crate::rolling::RollingReader::open(directory_path)?;
         let mut record_reader = crate::recordlog::RecordReader::open(rolling_reader);
@@ -82,6 +157,10 @@ impl MultiRecordLog {
                         records,
                         position,
                     } => {
+                        if queue == COMPRESSION_FORMAT_SENTINEL_QUEUE {
+                            // Format sentinel, not a user queue.
+                            continue;
+                        }
                         if !in_mem_queues.contains_queue(queue) {
                             in_mem_queues.ack_position(queue, position);
                         }
@@ -126,9 +205,24 @@ impl MultiRecordLog {
             next_persist: persist_policy.into(),
             multi_record_spare_buffer: Vec::new(),
         };
+        // A compression-enabled WAL advertises itself with a directory marker and a format
+        // sentinel record. The sentinel makes the pre-E020 recovery path fail loudly instead
+        // of silently dropping the compressed suffix. The marker is what lets a reader that
+        // declares it cannot decode compressed frames refuse to open.
+        if compression_enabled && !has_compression_format_marker(directory_path) {
+            write_compression_format_sentinel(&mut multi_record_log.record_log_writer)?;
+            create_compression_format_marker(directory_path)?;
+        }
         // Bytes written by recovery-time GC are not surfaced to any user-facing API.
         let _ = multi_record_log.run_gc_if_necessary()?;
         Ok(multi_record_log)
+    }
+
+    /// Test-only: corrupt every compressed in-memory batch so the fetch path must fail
+    /// loudly instead of serving an empty payload at a valid position.
+    #[cfg(test)]
+    pub(crate) fn corrupt_in_memory_for_test(&mut self) {
+        self.in_mem_queues.inject_compressed_batch_corruption();
     }
 
     #[cfg(test)]
@@ -356,6 +450,20 @@ impl MultiRecordLog {
         R: RangeBounds<u64> + 'static,
     {
         self.in_mem_queues.range(queue, range)
+    }
+
+    /// Returns the locations of the records in `range` without decompressing their
+    /// batches. Decode them with [`crate::RecordLocations::into_records`] after releasing
+    /// the WAL read lock.
+    pub fn record_locations<R>(
+        &self,
+        queue: &str,
+        range: R,
+    ) -> Result<impl Iterator<Item = RecordLocation> + '_, MissingQueue>
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        self.in_mem_queues.record_locations(queue, range)
     }
 
     /// Flush if the policy says it should be done

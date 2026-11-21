@@ -90,4 +90,8 @@ pub enum ReadRecordError {
     IoError(#[from] io::Error),
     #[error("Corruption")]
     Corruption,
+    /// The WAL was written with compressed frames, but the caller declared this reader
+    /// cannot decode them. Opening is refused rather than silently dropping the suffix.
+    #[error("WAL uses compressed frames, but this reader cannot decode them")]
+    CompressionUnsupported,
 }

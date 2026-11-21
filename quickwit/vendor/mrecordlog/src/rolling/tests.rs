@@ -1,5 +1,7 @@
 use super::*;
 use crate::{BlockRead, BlockWrite, PersistAction, BLOCK_NUM_BYTES};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[test]
 fn test_read_write() {
@@ -212,3 +214,95 @@ fn test_roll_fsync_is_deferred() {
     // Exactly one deferred fsync for the single roll.
     assert_eq!(writer.deferred_roll_fsync_count(), 1);
 }
+
+/// GC must join the pending roll fsync *before* it deletes the completed file. While the
+/// background fsync is gated, a `gc` run on another thread must block in `drain` and leave the
+/// file on disk; once the gate opens the fsync runs and only then is the file removed.
+#[test]
+fn test_gc_drains_pending_roll_fsync_before_delete() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let mut writer: RollingWriter = RollingReader::open(tmp_dir.path())
+        .unwrap()
+        .into_writer()
+        .unwrap();
+    let gate = writer.roll_fsync_gate();
+    gate.close();
+    let buf = vec![1u8; FRAME_NUM_BYTES];
+    for _ in 0..=NUM_BLOCKS_PER_FILE {
+        writer.write(&buf).unwrap();
+    }
+    assert_eq!(writer.list_file_numbers(), &[0, 1]);
+    let first_path = crate::rolling::directory::filepath(
+        tmp_dir.path(),
+        &FileNumber::for_test(0),
+    );
+    assert!(first_path.exists());
+    assert_eq!(writer.deferred_roll_fsync_count(), 0);
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = writer.gc();
+        let _ = done_tx.send(result.is_ok());
+    });
+    // The background fsync is still gated, so `gc` is blocked in `drain` and must not have
+    // deleted the completed file yet.
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "gc returned before the pending roll fsync drained"
+    );
+    assert!(
+        first_path.exists(),
+        "completed wal file was deleted while its fsync was still pending"
+    );
+
+    gate.open();
+    assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), true);
+    handle.join().unwrap();
+    assert!(
+        !first_path.exists(),
+        "gc did not delete the completed wal file after draining its fsync"
+    );
+}
+
+/// A background roll-fsync failure must surface on the next write, matching "a failed roll fsync
+/// fails the append" pre-E017 behaviour. The directory is removed while the fsync is gated so the
+/// directory sync fails deterministically.
+#[test]
+fn test_background_roll_fsync_error_surfaces_on_next_write() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let mut writer: RollingWriter = RollingReader::open(tmp_dir.path())
+        .unwrap()
+        .into_writer()
+        .unwrap();
+    let gate = writer.roll_fsync_gate();
+    gate.close();
+    let buf = vec![1u8; FRAME_NUM_BYTES];
+    for _ in 0..=NUM_BLOCKS_PER_FILE {
+        writer.write(&buf).unwrap();
+    }
+    assert_eq!(writer.list_file_numbers(), &[0, 1]);
+    assert_eq!(writer.deferred_roll_fsync_count(), 0);
+
+    // Removing the directory makes the background `sync_directory` fail with ENOENT. The file
+    // handle itself stays valid, so the data fsync is not the failure source.
+    std::fs::remove_dir_all(tmp_dir.path()).unwrap();
+    gate.open();
+    for _ in 0..1_000 {
+        if writer.deferred_roll_fsync_count() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(writer.deferred_roll_fsync_count(), 1);
+
+    let err = writer.write(&buf).unwrap_err();
+    assert!(
+        err.to_string().contains("background roll fsync failed"),
+        "unexpected error: {err}"
+    );
+    // The first error is surfaced once and then cleared, so a later write is not failed by the
+    // stale background error.
+    writer.write(&buf).unwrap();
+    writer.drain_roll_fsync().unwrap();
+}
+

@@ -1,16 +1,21 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::{Bound, RangeBounds, RangeToInclusive};
+use std::sync::Arc;
 
 use crate::error::AppendError;
 use crate::mem::QueueSummary;
-use crate::record::{MULTIPLEXED_RECORD_HEADER_LEN, MULTIRECORD_ENTRY_HEADER_LEN};
 use crate::rolling::FileNumber;
 use crate::Record;
 
 /// Number of bytes at the start of a compressed batch holding the decrypted length
 /// as a little-endian `u32` (the same prefix the record writer uses on disk).
 const UNCOMPRESSED_LEN_NUM_BYTES: usize = 4;
+
+/// Upper bound on the decompressed size accepted from the in-memory `u32` length
+/// prefix. A corrupt prefix would otherwise let us reserve several GiB before zstd
+/// rejects the payload. Mirrors the on-disk reader's cap.
+const MAX_IN_MEMORY_DECOMPRESSED_BYTES: usize = 1 << 30;
 
 #[derive(Clone)]
 struct RecordMeta {
@@ -34,13 +39,120 @@ struct Batch {
     is_compressed: bool,
 }
 
+/// A cheaply cloneable handle to one append batch's bytes (compressed or plaintext).
+///
+/// Cloning a `RecordBatch` is an `Arc` refcount bump: a fetch path can collect the
+/// batches it needs while holding the WAL read lock and decode them after the lock has
+/// been released.
+#[derive(Clone)]
+pub struct RecordBatch {
+    inner: Arc<Batch>,
+}
+
+/// The location of one record inside an append batch, collected under the WAL read lock.
+///
+/// The batch bytes are kept alive by the [`RecordBatch`] handle, so the payload can be
+/// decoded safely after the read lock is released.
+pub struct RecordLocation {
+    position: u64,
+    offset: usize,
+    len: usize,
+    batch: RecordBatch,
+}
+
+impl RecordLocation {
+    /// Position of the record in the queue.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Length in bytes of the record payload.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// A set of [`RecordLocation`]s collected under the WAL read lock.
+///
+/// Calling [`RecordLocations::into_records`] after the lock has been released decodes the
+/// (possibly compressed) batches into owned [`Record`] payloads without holding any WAL lock.
+#[derive(Default)]
+pub struct RecordLocations {
+    locations: Vec<RecordLocation>,
+}
+
+impl RecordLocations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            locations: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn push(&mut self, location: RecordLocation) {
+        self.locations.push(location);
+    }
+
+    pub fn len(&self) -> usize {
+        self.locations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.locations.is_empty()
+    }
+
+    /// Decodes the collected batches into owned records, decompressing each batch at most
+    /// once. The decoded `(position, payload)` sequence is identical to
+    /// [`MemQueue::range`].
+    pub fn into_records(self) -> impl Iterator<Item = Record<'static>> {
+        let mut decompressor = zstd::bulk::Decompressor::new().ok();
+        let mut plain_buffer: Vec<u8> = Vec::new();
+        let mut current_batch: Option<RecordBatch> = None;
+        self.locations.into_iter().map(move |location| {
+            let is_new_batch = current_batch
+                .as_ref()
+                .map_or(true, |current| !Arc::ptr_eq(&current.inner, &location.batch.inner));
+            if is_new_batch {
+                location
+                    .batch
+                    .inner
+                    .write_plain_into(decompressor.as_mut(), &mut plain_buffer);
+                current_batch = Some(location.batch.clone());
+            }
+            let end = location.offset + location.len;
+            assert!(
+                end <= plain_buffer.len(),
+                "in-memory WAL batch is corrupted: record at position {} has \
+                 [{}..{}] outside the {}-byte decoded batch",
+                location.position,
+                location.offset,
+                end,
+                plain_buffer.len()
+            );
+            let payload = Cow::Owned(plain_buffer[location.offset..end].to_vec());
+            Record {
+                position: location.position,
+                payload,
+            }
+        })
+    }
+}
+
 impl Batch {
     /// Copies the batch's plaintext into `out` (reusing `out`'s allocation).
     ///
-    /// A decompression failure leaves `out` empty; the payload accessors then yield
-    /// an empty payload rather than panicking. In-memory corruption is not expected
-    /// (the bytes are produced and owned by this process) and the on-disk record
-    /// remains authoritative until truncation.
+    /// A corrupted in-memory batch is **fatal**: the bytes are produced and owned by
+    /// this process, so a decode failure means RAM corruption. Returning an empty
+    /// payload here would let the fetch path treat a valid position as an empty record
+    /// and later truncate the authoritative on-disk record on ack (a data-loss path).
+    /// We therefore panic instead of ever serving an empty payload at a valid position.
     fn write_plain_into(
         &self,
         mut decompressor: Option<&mut zstd::bulk::Decompressor<'static>>,
@@ -49,21 +161,30 @@ impl Batch {
         out.clear();
         if self.is_compressed {
             let Some(decompressor) = decompressor.as_mut() else {
-                return;
+                panic!("in-memory WAL batch is corrupted: no zstd decompressor available");
             };
-            if self.bytes.len() < UNCOMPRESSED_LEN_NUM_BYTES {
-                return;
-            }
+            assert!(
+                self.bytes.len() >= UNCOMPRESSED_LEN_NUM_BYTES,
+                "in-memory WAL batch is corrupted: compressed blob is {} bytes",
+                self.bytes.len()
+            );
             let plain_len =
                 u32::from_le_bytes(self.bytes[..UNCOMPRESSED_LEN_NUM_BYTES].try_into().unwrap())
                     as usize;
+            assert!(
+                plain_len <= MAX_IN_MEMORY_DECOMPRESSED_BYTES,
+                "in-memory WAL batch is corrupted: declared {plain_len} plaintext bytes"
+            );
             out.resize(plain_len, 0);
-            if decompressor
+            match decompressor
                 .decompress_to_buffer(&self.bytes[UNCOMPRESSED_LEN_NUM_BYTES..], out)
-                .is_err()
             {
-                tracing::error!("failed to decompress in-memory record batch");
-                out.clear();
+                Ok(num_bytes) if num_bytes == plain_len => {}
+                Ok(num_bytes) => panic!(
+                    "in-memory WAL batch is corrupted: decoded {num_bytes} bytes, \
+                     expected {plain_len}"
+                ),
+                Err(err) => panic!("in-memory WAL batch is corrupted: {err}"),
             }
         } else {
             out.extend_from_slice(&self.bytes);
@@ -74,8 +195,9 @@ impl Batch {
 #[derive(Default)]
 pub(crate) struct MemQueue {
     // Consecutive records, grouped by append batch and stored compressed when the
-    // writer compressed them for disk.
-    batches: VecDeque<Batch>,
+    // writer compressed them for disk. The `Arc` makes a batch handle cheap to clone so
+    // the fetch path can release the read lock before decompressing.
+    batches: VecDeque<Arc<Batch>>,
     start_position: u64,
     record_metas: Vec<RecordMeta>,
 }
@@ -138,11 +260,16 @@ impl MemQueue {
 
     fn record_from_plain(&self, record_meta: &RecordMeta, plain: &[u8]) -> Record<'_> {
         let end = record_meta.offset + record_meta.len;
-        let payload = if end <= plain.len() {
-            Cow::Owned(plain[record_meta.offset..end].to_vec())
-        } else {
-            Cow::Owned(Vec::new())
-        };
+        assert!(
+            end <= plain.len(),
+            "in-memory WAL batch is corrupted: record at position {} has \
+             [{}..{}] outside the {}-byte decoded batch",
+            record_meta.position,
+            record_meta.offset,
+            end,
+            plain.len()
+        );
+        let payload = Cow::Owned(plain[record_meta.offset..end].to_vec());
         Record {
             position: record_meta.position,
             payload,
@@ -203,10 +330,10 @@ impl MemQueue {
                 len,
             });
         }
-        self.batches.push_back(Batch {
+        self.batches.push_back(Arc::new(Batch {
             bytes: blob,
             is_compressed,
-        });
+        }));
         Ok(())
     }
 
@@ -237,9 +364,12 @@ impl MemQueue {
             .binary_search_by_key(&position, |record| record.position)
     }
 
-    pub fn range<R>(&self, range: R) -> impl Iterator<Item = Record<'_>> + '_
-    where R: RangeBounds<u64> + 'static {
-        let start_idx: usize = match range.start_bound() {
+    /// Returns the index of the first record at or after the start bound of `range`.
+    fn range_start_idx<R>(&self, range: &R) -> usize
+    where
+        R: RangeBounds<u64>,
+    {
+        match range.start_bound() {
             Bound::Included(&start_from) => {
                 // if pos is included, we can use position_to_idx result directly
                 self.position_to_idx(start_from)
@@ -253,7 +383,41 @@ impl MemQueue {
                     .unwrap_or_else(std::convert::identity)
             }
             Bound::Unbounded => 0,
-        };
+        }
+    }
+
+    /// Returns the locations of the records in `range`, without decompressing any batch.
+    ///
+    /// Each item keeps its batch alive through a [`RecordBatch`] handle, so the caller may
+    /// release the WAL read lock and decode the payloads afterwards with
+    /// [`RecordLocations::into_records`]. The decoded `(position, payload)` sequence is
+    /// identical to [`MemQueue::range`].
+    pub fn record_locations<R>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = RecordLocation> + '_
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        let start_idx = self.range_start_idx(&range);
+        (start_idx..self.record_metas.len())
+            .take_while(move |idx| range.contains(&self.record_metas[*idx].position))
+            .map(move |idx| {
+                let record_meta = &self.record_metas[idx];
+                RecordLocation {
+                    position: record_meta.position,
+                    offset: record_meta.offset,
+                    len: record_meta.len,
+                    batch: RecordBatch {
+                        inner: self.batches[record_meta.batch_idx].clone(),
+                    },
+                }
+            })
+    }
+
+    pub fn range<R>(&self, range: R) -> impl Iterator<Item = Record<'_>> + '_
+    where R: RangeBounds<u64> + 'static {
+        let start_idx: usize = self.range_start_idx(&range);
         let mut decompressor = zstd::bulk::Decompressor::new().ok();
         let mut plain_buffer: Vec<u8> = Vec::new();
         let mut current_batch_idx: Option<usize> = None;
@@ -311,12 +475,25 @@ impl MemQueue {
             + self.record_metas.len() * std::mem::size_of::<RecordMeta>()
     }
 
+    /// Test-only corruption injector for the in-memory compression regression: overwrite
+    /// every compressed batch's zstd payload with `0xff` so decoding deterministically fails.
+    #[cfg(test)]
+    pub(crate) fn inject_compressed_batch_corruption(&mut self) {
+        for batch in &mut self.batches {
+            if let Some(batch) = Arc::get_mut(batch) {
+                if batch.is_compressed && batch.bytes.len() > UNCOMPRESSED_LEN_NUM_BYTES {
+                    batch.bytes[UNCOMPRESSED_LEN_NUM_BYTES..].fill(0xff);
+                }
+            }
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.batches
             .iter()
             .map(|batch| batch.bytes.capacity())
             .sum::<usize>()
-            + self.batches.capacity() * std::mem::size_of::<Batch>()
+            + self.batches.capacity() * std::mem::size_of::<Arc<Batch>>()
             + self.record_metas.capacity() * std::mem::size_of::<RecordMeta>()
     }
 }

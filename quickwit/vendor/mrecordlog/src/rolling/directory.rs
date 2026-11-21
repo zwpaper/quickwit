@@ -46,7 +46,7 @@ enum RollSyncMsg {
 /// Test-only gate and counter, used to observe that a roll schedules its fsync instead of running
 /// it inline on the write path.
 #[cfg(test)]
-struct SyncGate {
+pub(crate) struct SyncGate {
     open: Mutex<bool>,
     cv: Condvar,
     sync_count: AtomicUsize,
@@ -69,11 +69,11 @@ impl SyncGate {
         }
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         *self.open.lock().unwrap() = false;
     }
 
-    fn open(&self) {
+    pub(crate) fn open(&self) {
         *self.open.lock().unwrap() = true;
         self.cv.notify_all();
     }
@@ -116,14 +116,16 @@ impl RollSyncer {
                             #[cfg(test)]
                             gate_thread.wait_open();
                             let result = file.sync_data().and_then(|()| sync_directory(&dir));
-                            #[cfg(test)]
-                            gate_thread.sync_count.fetch_add(1, Ordering::SeqCst);
                             if let Err(sync_err) = result {
                                 let mut slot = err_slot.lock().unwrap();
                                 if slot.is_none() {
                                     *slot = Some(sync_err);
                                 }
                             }
+                            // Test-only counter, incremented last so a test that observes
+                            // `sync_count == 1` also observes the stored error.
+                            #[cfg(test)]
+                            gate_thread.sync_count.fetch_add(1, Ordering::SeqCst);
                         }
                         RollSyncMsg::Drain(ack) => {
                             let _ = ack.send(());
@@ -424,6 +426,13 @@ impl RollingWriter {
     pub(crate) fn gc(&mut self) -> io::Result<()> {
         self.syncer.drain()?;
         self.directory.gc()
+    }
+
+    /// Test-only handle to the background fsync gate, so a test can gate the syncer from one
+    /// thread while another thread blocks in `gc`/`drain`.
+    #[cfg(test)]
+    pub(crate) fn roll_fsync_gate(&self) -> Arc<SyncGate> {
+        Arc::clone(&self.syncer.gate)
     }
 
     #[cfg(test)]

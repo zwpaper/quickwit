@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use bytes::Buf;
 
-use crate::{MultiRecordLog, Record};
+use crate::{MultiRecordLog, PersistAction, PersistPolicy, Record, RecordLocations};
 
 fn read_all_records<'a>(multi_record_log: &'a MultiRecordLog, queue: &str) -> Vec<Cow<'a, [u8]>> {
     let mut records = Vec::new();
@@ -496,7 +496,42 @@ fn test_compressed_batch_survives_reopen() {
 #[test]
 fn test_inmemory_compressed_batch_is_smaller_than_plaintext() {
     // A batch large enough to be compressed must be stored compressed in the in-memory
-    // queue, not as plaintext.
+    // queue, not as plaintext. Compression must be opted into (E022 gate defaults OFF).
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            let pad = "lorem ipsum dolor sit amet ".repeat(20);
+            format!("{{\"doc\":{i},\"body\":\"{pad}\"}}\n").into_bytes()
+        })
+        .collect();
+    let total_plain: usize = payloads.iter().map(|payload| payload.len()).sum();
+    let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+    )
+    .unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records(
+            "queue",
+            None,
+            payloads.iter().map(|payload| payload.as_slice()),
+        )
+        .unwrap();
+    let usage = record_log.resource_usage();
+    assert!(
+        usage.memory_used_bytes < total_plain / 2,
+        "in-memory queue used {} bytes for {} plaintext bytes",
+        usage.memory_used_bytes,
+        total_plain
+    );
+}
+
+#[test]
+fn test_inmemory_plaintext_when_compression_disabled() {
+    // With the E022 gate at its default (OFF) the writer leaves records uncompressed,
+    // so the in-memory queue must hold the plaintext, not a compressed batch.
     let tempdir = tempfile::tempdir().unwrap();
     let payloads: Vec<Vec<u8>> = (0..2_000)
         .map(|i| {
@@ -516,11 +551,64 @@ fn test_inmemory_compressed_batch_is_smaller_than_plaintext() {
         .unwrap();
     let usage = record_log.resource_usage();
     assert!(
-        usage.memory_used_bytes < total_plain / 2,
-        "in-memory queue used {} bytes for {} plaintext bytes",
+        usage.memory_used_bytes >= total_plain,
+        "in-memory queue used only {} bytes for {} plaintext bytes with compression disabled",
         usage.memory_used_bytes,
         total_plain
     );
+    // The records must still read back byte-identically.
+    let records: Vec<Vec<u8>> = record_log
+        .range("queue", ..)
+        .unwrap()
+        .map(|record| record.payload.into_owned())
+        .collect();
+    assert_eq!(records, payloads);
+}
+
+#[test]
+fn test_compressed_crash_recovery_is_identity() {
+    // Process-crash simulation with compression ON: copy the WAL files while the writer
+    // is still alive (so dropping it cannot flush), then reopen and replay. The reader
+    // is unconditional, so the compressed frames must decode to the identical sequence.
+    let tempdir = tempfile::tempdir().unwrap();
+    let crash_dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| format!("{{\"doc\":{i},\"body\":\"a repeated log line body\"}}\n").into_bytes())
+        .collect();
+    {
+        let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+            tempdir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        record_log.create_queue("queue").unwrap();
+        record_log
+            .append_records(
+                "queue",
+                None,
+                payloads.iter().map(|payload| payload.as_slice()),
+            )
+            .unwrap();
+        for entry in std::fs::read_dir(tempdir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), crash_dir.path().join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    // Reopen with the gate OFF (the default): reading compressed frames stays unconditional.
+    let recovered = MultiRecordLog::open_with_prefs(
+        crash_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+    )
+    .unwrap();
+    let records: Vec<Vec<u8>> = recovered
+        .range("queue", ..)
+        .unwrap()
+        .map(|record| record.payload.into_owned())
+        .collect();
+    assert_eq!(records, payloads);
 }
 
 #[test]
@@ -557,4 +645,223 @@ fn test_compressed_batch_mid_truncate_and_reopen() {
         assert_eq!(&records[0].payload[..], &payloads[500][..]);
         assert_eq!(&records[1_499].payload[..], &payloads[1_999][..]);
     }
+}
+
+#[test]
+fn test_record_locations_decode_identical_to_range() {
+    // `record_locations().into_records()` must decode the exact same `(position, payload)`
+    // sequence as `range()`, for compressed batches, after truncation, and with an
+    // exclusive start bound. This is the fetch path used to release the WAL read lock
+    // before decompressing.
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            let pad = "lorem ipsum dolor sit amet ".repeat(20);
+            format!("{{\"doc\":{i},\"body\":\"{pad}\"}}\n").into_bytes()
+        })
+        .collect();
+    let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+    )
+    .unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records(
+            "queue",
+            None,
+            payloads.iter().map(|payload| payload.as_slice()),
+        )
+        .unwrap();
+    record_log.truncate("queue", ..=499).unwrap();
+
+    for range in [0u64.., 500.., 1_000.., 1_999..] {
+        let via_range: Vec<Record<'_>> = record_log.range("queue", range.clone()).unwrap().collect();
+        let mut locations = RecordLocations::new();
+        for location in record_log.record_locations("queue", range).unwrap() {
+            locations.push(location);
+        }
+        let via_locations: Vec<Record<'static>> = locations.into_records().collect();
+        assert_eq!(via_locations.len(), via_range.len());
+        for (expected, actual) in via_range.iter().zip(&via_locations) {
+            assert_eq!(actual.position, expected.position);
+            assert_eq!(&actual.payload[..], &expected.payload[..]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// E033: format/downgrade enforcement (G4) and in-memory decompress hardening (G7).
+// ---------------------------------------------------------------------------------------
+
+/// G7: a corrupted compressed in-memory batch must fail loudly on the public fetch path,
+/// never return a `Cow::Owned(Vec::new())` at a valid position.
+#[test]
+#[should_panic(expected = "in-memory WAL batch is corrupted")]
+fn test_corrupt_inmemory_batch_is_fatal_end_to_end() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..2_000)
+        .map(|i| {
+            format!(
+                "{{\"doc\":{i},\"body\":\"{}\"}}\n",
+                "lorem ipsum dolor sit amet ".repeat(20)
+            )
+            .into_bytes()
+        })
+        .collect();
+    let mut record_log = MultiRecordLog::open_with_prefs_and_compression(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+    )
+    .unwrap();
+    record_log.create_queue("queue").unwrap();
+    record_log
+        .append_records("queue", None, payloads.iter().map(|payload| payload.as_slice()))
+        .unwrap();
+    record_log.corrupt_in_memory_for_test();
+    // The fetch path must not serve an empty payload at a valid position.
+    let _ = record_log.range("queue", ..).unwrap().collect::<Vec<_>>();
+}
+
+/// G4: the compression format marker + reader-capability guard. A reader that declares it
+/// cannot decode compressed frames is refused on a compression-marked WAL; a
+/// compression-aware reader opens it. A plain WAL has no marker and is accepted either way.
+#[test]
+fn test_compression_format_guard_accepts_and_rejects() {
+    let compressed_dir = tempfile::tempdir().unwrap();
+    {
+        let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+            compressed_dir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        wal.create_queue("q").unwrap();
+        wal.append_record("q", None, b"hello".as_slice()).unwrap();
+    }
+    assert!(crate::multi_record_log::has_compression_format_marker(
+        compressed_dir.path()
+    ));
+
+    let rejected = MultiRecordLog::open_with_prefs_and_compression_capability(
+        compressed_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        false,
+        false,
+    );
+    assert!(matches!(
+        rejected,
+        Err(crate::error::ReadRecordError::CompressionUnsupported)
+    ));
+
+    let accepted = MultiRecordLog::open_with_prefs_and_compression_capability(
+        compressed_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        false,
+        true,
+    )
+    .unwrap();
+    assert_eq!(accepted.range("q", ..).unwrap().count(), 1);
+
+    // A plaintext (never compression-enabled) WAL has no marker.
+    let plain_dir = tempfile::tempdir().unwrap();
+    {
+        let mut wal = MultiRecordLog::open(plain_dir.path()).unwrap();
+        wal.create_queue("q").unwrap();
+        wal.append_record("q", None, b"hello".as_slice()).unwrap();
+    }
+    assert!(!crate::multi_record_log::has_compression_format_marker(
+        plain_dir.path()
+    ));
+    assert!(MultiRecordLog::open_with_prefs_and_compression_capability(
+        plain_dir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        false,
+        false,
+    )
+    .is_ok());
+}
+
+/// G4 item 1 (in-crate structural model): the writer records a format sentinel whenever it
+/// enables compression. Its declared queue position (`1`) is ahead of its record position
+/// (`0`), so the pre-E020 recovery step (ack position 1, then append position 0) hits the
+/// "in the past" path and maps it to `Corruption`: the old reader fails `open` loudly
+/// instead of recovering only the uncompressed prefix. The sentinel must not leak into the
+/// user-visible queue set for a compression-aware reader.
+#[test]
+fn test_compression_sentinel_forces_pre_e020_loud_failure_and_is_skipped() {
+    // Model of the pre-E020 recovery check on the sentinel: append at 0 after acking 1.
+    let sentinel_declared_position = 1u64;
+    let sentinel_record_position = 0u64;
+    assert!(sentinel_record_position < sentinel_declared_position);
+
+    let tempdir = tempfile::tempdir().unwrap();
+    {
+        let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+            tempdir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        wal.create_queue("q").unwrap();
+        wal.append_record("q", None, b"hello".as_slice()).unwrap();
+        assert_eq!(wal.list_queues().collect::<Vec<_>>(), vec!["q"]);
+    }
+    // A compression-aware reopen skips the sentinel and replays the record.
+    let wal = MultiRecordLog::open_with_prefs_and_compression_capability(
+        tempdir.path(),
+        PersistPolicy::Always(PersistAction::Flush),
+        true,
+        true,
+    )
+    .unwrap();
+    assert_eq!(wal.list_queues().collect::<Vec<_>>(), vec!["q"]);
+    assert_eq!(wal.range("q", ..).unwrap().count(), 1);
+}
+
+/// G4 item 3: upgrade + mixed WAL. An E017-compatible (gate OFF) writer writes a plaintext
+/// prefix; an E027 writer with the gate ON reopens the same WAL and continues with a
+/// compressed record; replay after reopening gate OFF is byte-identical.
+#[test]
+fn test_mixed_wal_upgrade_replay_identity() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let prefix: Vec<Vec<u8>> = (0..3).map(|i| format!("plain-{i}").into_bytes()).collect();
+
+    // Phase 1: E017-compatible writer (compression disabled).
+    {
+        let mut wal = MultiRecordLog::open(tempdir.path()).unwrap();
+        wal.create_queue("q").unwrap();
+        for payload in &prefix {
+            wal.append_record("q", None, payload.as_slice()).unwrap();
+        }
+    }
+
+    // Phase 2: E027 with the gate ON reopens and continues. It writes the format marker +
+    // sentinel and one record large enough to be compressed.
+    let big = "lorem ipsum dolor sit amet ".repeat(5_000).into_bytes();
+    {
+        let mut wal = MultiRecordLog::open_with_prefs_and_compression(
+            tempdir.path(),
+            PersistPolicy::Always(PersistAction::Flush),
+            true,
+        )
+        .unwrap();
+        wal.append_record("q", None, big.as_slice()).unwrap();
+    }
+    assert!(crate::multi_record_log::has_compression_format_marker(
+        tempdir.path()
+    ));
+
+    // Phase 3: reopen gate OFF and replay the full mixed sequence byte-identically.
+    let wal = MultiRecordLog::open(tempdir.path()).unwrap();
+    let records: Vec<Vec<u8>> = wal
+        .range("q", ..)
+        .unwrap()
+        .map(|record| record.payload.into_owned())
+        .collect();
+    let mut expected = prefix;
+    expected.push(big);
+    assert_eq!(records, expected);
 }

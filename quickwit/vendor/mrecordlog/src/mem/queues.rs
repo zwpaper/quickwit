@@ -4,7 +4,7 @@ use std::ops::{RangeBounds, RangeToInclusive};
 use tracing::{info, warn};
 
 use crate::error::{AlreadyExists, AppendError, MissingQueue};
-use crate::mem::{MemQueue, QueuesSummary};
+use crate::mem::{MemQueue, QueuesSummary, RecordLocation};
 use crate::rolling::FileNumber;
 use crate::Record;
 
@@ -61,6 +61,21 @@ impl MemQueues {
     {
         if let Some(queue) = self.queues.get(queue) {
             Ok(queue.range(range))
+        } else {
+            Err(MissingQueue(queue.to_string()))
+        }
+    }
+
+    pub fn record_locations<R>(
+        &self,
+        queue: &str,
+        range: R,
+    ) -> Result<impl Iterator<Item = RecordLocation> + '_, MissingQueue>
+    where
+        R: RangeBounds<u64> + 'static,
+    {
+        if let Some(queue) = self.queues.get(queue) {
+            Ok(queue.record_locations(range))
         } else {
             Err(MissingQueue(queue.to_string()))
         }
@@ -184,6 +199,14 @@ impl MemQueues {
             Some(queue.truncate_head(position))
         } else {
             None
+        }
+    }
+
+    /// Test-only: corrupt every compressed in-memory batch so decoding fails.
+    #[cfg(test)]
+    pub(crate) fn inject_compressed_batch_corruption(&mut self) {
+        for queue in self.queues.values_mut() {
+            queue.inject_compressed_batch_corruption();
         }
     }
 
