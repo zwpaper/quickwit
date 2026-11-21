@@ -16,6 +16,7 @@
 
 mod indexed_split;
 mod indexing_service_message;
+mod ingest_source_events;
 mod indexing_statistics;
 mod merge_planner_message;
 mod merge_scratch;
@@ -39,6 +40,7 @@ pub use indexing_service_message::{
     DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnPipeline,
 };
 pub use indexing_statistics::IndexingStatistics;
+pub use ingest_source_events::IngestSourceIdle;
 pub use merge_planner_message::NewSplits;
 pub use merge_scratch::MergeScratch;
 pub use merge_statistics::MergeStatistics;

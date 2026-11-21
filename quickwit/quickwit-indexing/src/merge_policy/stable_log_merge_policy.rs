@@ -122,6 +122,22 @@ impl MergePolicy for StableLogMergePolicy {
         }
     }
 
+    /// E041: post-ingest compaction. The event-driven planner stops as soon as every level
+    /// holds fewer than `merge_factor` splits, leaving an under-saturated small-split tail
+    /// frozen at the end of ingest. When enabled, this finalize hook merges the residual
+    /// immature splits down to a policy-defined layout, regardless of how much merge work
+    /// overlapped ingestion.
+    fn finalize_operations(&self, splits: &mut Vec<SplitMetadata>) -> Vec<MergeOperation> {
+        if !self.config.post_ingest_compaction {
+            return Vec::new();
+        }
+        self.compaction_operations(splits)
+    }
+
+    fn post_ingest_compaction(&self) -> bool {
+        self.config.post_ingest_compaction
+    }
+
     #[cfg(test)]
     fn check_is_valid(&self, merge_op: &MergeOperation, _remaining_splits: &[SplitMetadata]) {
         assert!(merge_op.splits_as_slice().len() <= self.config.max_merge_factor);
@@ -178,6 +194,62 @@ fn cmp_splits_by_reverse_time_end(left: &SplitMetadata, right: &SplitMetadata) -
 }
 
 impl StableLogMergePolicy {
+    /// Builds a single, fully-convergent compaction plan over the residual immature splits.
+    ///
+    /// Splits are ordered exactly like the stable-log planner (reverse time-end), then folded
+    /// into consecutive runs of up to `merge_factor` splits that stay below
+    /// `split_num_docs_target`. Every run of two or more splits becomes one merge operation, so
+    /// a single finalize pass folds the whole under-saturated tail into at most
+    /// `ceil(num_splits / merge_factor)` splits. Mature splits are never touched.
+    fn compaction_operations(&self, splits: &mut Vec<SplitMetadata>) -> Vec<MergeOperation> {
+        let now = OffsetDateTime::now_utc();
+        let mut young_splits: Vec<SplitMetadata> = Vec::new();
+        let mut mature_splits: Vec<SplitMetadata> = Vec::new();
+        for split in splits.drain(..) {
+            if split.is_mature(now) {
+                mature_splits.push(split);
+            } else {
+                young_splits.push(split);
+            }
+        }
+        // Splits that cannot be paired with a neighbour are put back untouched.
+        splits.extend(mature_splits);
+        if young_splits.len() < 2 {
+            splits.extend(young_splits);
+            return Vec::new();
+        }
+        young_splits.sort_unstable_by(cmp_splits_by_reverse_time_end);
+
+        let mut merge_operations: Vec<MergeOperation> = Vec::new();
+        let mut current_run: Vec<SplitMetadata> = Vec::new();
+        let mut current_run_num_docs: usize = 0;
+        for split in young_splits {
+            // Close the current run before it would either exceed `merge_factor` splits or
+            // reach `split_num_docs_target` once this split is added.
+            let run_is_full = current_run.len() >= self.config.merge_factor;
+            let run_would_reach_target =
+                current_run_num_docs + split.num_docs >= self.split_num_docs_target;
+            if run_is_full || run_would_reach_target {
+                if current_run.len() >= 2 {
+                    merge_operations.push(MergeOperation::new_merge_operation(
+                        std::mem::take(&mut current_run),
+                    ));
+                } else {
+                    splits.append(&mut current_run);
+                }
+                current_run_num_docs = 0;
+            }
+            current_run_num_docs += split.num_docs;
+            current_run.push(split);
+        }
+        if current_run.len() >= 2 {
+            merge_operations.push(MergeOperation::new_merge_operation(current_run));
+        } else {
+            splits.append(&mut current_run);
+        }
+        merge_operations
+    }
+
     fn merge_operations(&self, splits: &mut Vec<SplitMetadata>) -> Vec<MergeOperation> {
         if splits.len() < 2 {
             return Vec::new();
@@ -451,6 +523,59 @@ mod tests {
         assert!(merge_policy.operations(&mut splits).is_empty());
     }
 
+    fn compaction_policy() -> StableLogMergePolicy {
+        StableLogMergePolicy::new(
+            StableLogMergePolicyConfig {
+                post_ingest_compaction: true,
+                ..Default::default()
+            },
+            10_000_000,
+        )
+    }
+
+    #[test]
+    fn test_post_ingest_compaction_is_noop_when_disabled() {
+        // Default policy: a level holding fewer than `merge_factor` splits is a fixpoint.
+        let merge_policy = StableLogMergePolicy::default();
+        let mut splits = create_splits(&merge_policy, vec![1_000_000; 5]);
+        assert!(merge_policy.operations(&mut splits).is_empty());
+        assert!(merge_policy.finalize_operations(&mut splits).is_empty());
+        assert_eq!(splits.len(), 5);
+    }
+
+    #[test]
+    fn test_post_ingest_compaction_folds_under_saturated_tail() {
+        // The same residual the event-driven planner leaves frozen is folded by the
+        // finalize compaction pass: 5 x 1 M docs -> one 5 M split (below the 10 M target).
+        let merge_policy = compaction_policy();
+        let mut splits = create_splits(&merge_policy, vec![1_000_000; 5]);
+        assert!(merge_policy.operations(&mut splits).is_empty());
+        let merge_ops = merge_policy.finalize_operations(&mut splits);
+        assert_eq!(merge_ops.len(), 1);
+        assert_eq!(merge_ops[0].splits_as_slice().len(), 5);
+        assert_eq!(splits.len(), 0);
+    }
+
+    #[test]
+    fn test_post_ingest_compaction_emits_disjoint_ops_capped_by_merge_factor() {
+        let merge_policy = compaction_policy();
+        // 25 x 1 M docs; runs of at most `merge_factor` (10) splits and below target.
+        let mut splits = create_splits(&merge_policy, vec![1_000_000; 25]);
+        let merge_ops = merge_policy.finalize_operations(&mut splits);
+        let merged_splits: usize = merge_ops
+            .iter()
+            .map(|op| op.splits_as_slice().len())
+            .sum();
+        assert_eq!(merged_splits, 25);
+        assert!(splits.is_empty());
+        assert_eq!(merge_ops.len(), 3);
+        assert!(
+            merge_ops
+                .iter()
+                .all(|op| op.splits_as_slice().len() <= 10)
+        );
+    }
+
     #[test]
     fn test_stable_log_merge_policy_just_enough_splits_for_a_merge() {
         let merge_policy = StableLogMergePolicy::default();
@@ -642,6 +767,7 @@ mod tests {
             merge_factor: 4,
             max_merge_factor: 6,
             maturation_period: Duration::from_hours(1),
+            post_ingest_compaction: false,
         };
         let merge_policy = StableLogMergePolicy::new(config, 10_000_000);
         crate::merge_policy::tests::proptest_merge_policy(&merge_policy);

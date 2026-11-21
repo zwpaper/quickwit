@@ -51,7 +51,9 @@ use super::{
 };
 use crate::actors::DocProcessor;
 use crate::metrics::{BACKLOG_FORCE_COMMIT_TOTAL, IDLE_FORCE_COMMIT_TOTAL};
-use crate::models::{LocalShardPositionsUpdate, NewPublishLock, PublishLock, SharedPublishToken};
+use crate::models::{
+    IngestSourceIdle, LocalShardPositionsUpdate, NewPublishLock, PublishLock, SharedPublishToken,
+};
 
 pub struct IngestSourceFactory;
 
@@ -560,6 +562,11 @@ impl Source for IngestSource {
                     num_empty_rounds=%self.empty_fetch_rounds,
                     "Input idle: force-committing the open workbench."
                 );
+                // E041: explicit end-of-ingest / source-quiescence signal consumed by the
+                // opt-in post-ingest compaction pass. Emitted once per idle episode.
+                self.event_broker.publish(IngestSourceIdle {
+                    source_uid: self.client_id.source_uid.clone(),
+                });
                 let mut drain_batch = BatchBuilder::new(SourceType::IngestV2);
                 drain_batch.force_commit();
                 let message = drain_batch.build();

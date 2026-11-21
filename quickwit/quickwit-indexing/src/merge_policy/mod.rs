@@ -203,6 +203,13 @@ pub trait MergePolicy: Send + Sync + fmt::Debug {
         Vec::new()
     }
 
+    /// E041: returns true when the policy wants the merge planner to run periodic
+    /// post-ingest compaction (see `StableLogMergePolicy::post_ingest_compaction`).
+    /// Default `false` keeps the historical event-driven planner behaviour.
+    fn post_ingest_compaction(&self) -> bool {
+        false
+    }
+
     /// Returns split maturity.
     /// A split is either:
     /// - `Mature` if it does not undergo new merge operations.
@@ -487,6 +494,7 @@ pub mod tests {
             merge_policy.clone(),
             merge_task_mailbox,
             universe.get_or_spawn_one::<MergeSchedulerService>(),
+            quickwit_common::pubsub::EventBroker::default(),
         );
         let mut split_index: HashMap<String, SplitMetadata> = HashMap::default();
         let (merge_planner_mailbox, merge_planner_handler) =

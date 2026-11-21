@@ -86,6 +86,19 @@ pub struct StableLogMergePolicyConfig {
     #[serde(deserialize_with = "parse_human_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub maturation_period: Duration,
+    /// E041: when enabled, the merge planner runs a post-ingest compaction pass at
+    /// pipeline finalize: the residual immature splits are merged, in stable-log order,
+    /// into consecutive runs of up to `merge_factor` splits that stay below
+    /// `split_num_docs_target`. This turns the equilibrium layout into a policy-defined
+    /// quantity instead of a side effect of how many merge generations overlapped ingest.
+    /// Default `false` preserves the historical stable-log finalize (a no-op).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub post_ingest_compaction: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_merge_factor() -> usize {
@@ -115,6 +128,7 @@ impl Default for StableLogMergePolicyConfig {
             merge_factor: default_merge_factor(),
             max_merge_factor: default_max_merge_factor(),
             maturation_period: default_maturation_period(),
+            post_ingest_compaction: false,
         }
     }
 }
